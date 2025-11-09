@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>🎧 Smart Fast-Forward Player (AssemblyAI)</title>
+  <style>
+    body { background:#0e0e0e; color:#fff; font-family:sans-serif; text-align:center; margin-top:60px; }
+    input[type="range"] { width:60%; margin-top:20px; }
+    #keywordDisplay { margin-top:30px; font-size:1.6em; color:#ffd500; }
+    #status { margin-top:20px; font-style:italic; }
+  </style>
+</head>
+<body>
+  <h1> Smart Fast-Forward Audio Player</h1>
+
+  <input type="file" id="audioFile" accept="audio/*"><br><br>
+  <audio id="audio" controls></audio><br>
+
+  <label>Playback Speed:</label>
+  <input type="range" id="speed" min="0.5" max="4" step="0.1" value="1">
+  <span id="label">1.0x</span>
+  <div id="keywordDisplay"></div>
+  <div id="status"></div>
+
+  <script>
+    const API_KEY = "YOUR_ASSEMBLYAI_API_KEY"; // replace this with your key
+    const uploadUrl = "https://api.assemblyai.com/v2/upload";
+    const transcribeUrl = "https://api.assemblyai.com/v2/transcript";
+
+    const audio = document.getElementById('audio');
+    const slider = document.getElementById('speed');
+    const label = document.getElementById('label');
+    const display = document.getElementById('keywordDisplay');
+    const status = document.getElementById('status');
+    const fileInput = document.getElementById('audioFile');
+
+    let informativeWords = [];
+    let timer = null;
+
+    // Basic common words
+    const commonWords = new Set(["the","and","is","in","on","it","of","to","a","an","i","you","that","this"]);
+
+    fileInput.onchange = async () => {
+      const file = fileInput.files[0];
+      if (!file) return;
+      audio.src = URL.createObjectURL(file);
+      status.textContent = "Uploading audio...";
+      
+      const audioUrl = await uploadToAssembly(file);
+      status.textContent = "Processing transcription...";
+      
+      const words = await getTranscript(audioUrl);
+      informativeWords = words.filter(w => !commonWords.has(w.text.toLowerCase()));
+      status.textContent = "Done! You can now play and scrub through keywords.";
+      console.log("Informative words:", informativeWords);
+    };
+
+    async function uploadToAssembly(file) {
+      const resp = await fetch(uploadUrl, {
+        method: "POST",
+        headers: { "Authorization": API_KEY },
+        body: file
+      });
+      const data = await resp.json();
+      return data.upload_url;
+    }
+
+    async function getTranscript(audioUrl) {
+      const resp = await fetch(transcribeUrl, {
+        method: "POST",
+        headers: { "Authorization": API_KEY, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          audio_url: audioUrl,
+          speaker_labels: false,
+          punctuate: true,
+          format_text: true,
+          word_boost: [],
+          boost_param: "default",
+          disfluencies: false
+        })
+      });
+      const job = await resp.json();
+
+      
+      let statusCheck;
+      do {
+        await new Promise(r => setTimeout(r, 5000));
+        const poll = await fetch(`${transcribeUrl}/${job.id}`, {
+          headers: { "Authorization": API_KEY }
+        });
+        statusCheck = await poll.json();
+      } while (statusCheck.status !== "completed");
+
+      return statusCheck.words.map(w => ({ text: w.text, start: w.start / 1000 }));
+    }
+
+   
+    slider.oninput = () => {
+      const sp = parseFloat(slider.value);
+      label.textContent = sp.toFixed(1) + "x";
+      audio.playbackRate = sp;
+      if (sp > 2) {
+        if (!timer) startSmartScrub();
+      } else stopSmartScrub();
+    };
+
+    function startSmartScrub() {
+      timer = setInterval(() => {
+        if (audio.paused) return;
+        const sp = audio.playbackRate;
+        if (sp <= 2) return stopSmartScrub();
+        const next = informativeWords.find(w => w.start > audio.currentTime);
+        if (next) {
+          audio.currentTime = next.start;
+          displayWord(next.text);
+        } else stopSmartScrub();
+      }, 400);
+    }
+
+    function stopSmartScrub() {
+      clearInterval(timer);
+      timer = null;
+      display.textContent = "";
+    }
+
+    function displayWord(w) {
+      display.textContent = w;
+    }
+  </script>
+</body>
+</html>
