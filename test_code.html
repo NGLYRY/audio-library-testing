@@ -23,7 +23,7 @@
   <div id="status"></div>
 
   <script>
-    const API_KEY = "API_KEY_INSERT"; // replace this with your key https://www.assemblyai.com/
+    const API_KEY = "fae6aef01046408cb7e2c932adcf6e42"; // replace this with your key https://www.assemblyai.com/
     const uploadUrl = "https://api.assemblyai.com/v2/upload";
     const transcribeUrl = "https://api.assemblyai.com/v2/transcript";
 
@@ -34,8 +34,12 @@
     const status = document.getElementById('status');
     const fileInput = document.getElementById('audioFile');
 
-    let informativeWords = [];
+  let informativeWords = []; 
     let timer = null;
+    let isDwelling = false;
+    let dwellTimeout = null;
+    let fastSpeed = 1;
+    let nextIndex = 0;
 
     // Basic common words
     const commonWords = new Set(["the","and","is","in","on","it","of","to","a","an","i","you","that","this"]);
@@ -45,12 +49,13 @@
       if (!file) return;
       audio.src = URL.createObjectURL(file);
       status.textContent = "Uploading audio...";
-      
       const audioUrl = await uploadToAssembly(file);
       status.textContent = "Processing transcription...";
       
       const words = await getTranscript(audioUrl);
-      informativeWords = words.filter(w => !commonWords.has(w.text.toLowerCase()));
+      // Build informative words using TF-IDF over time windows
+      informativeWords = selectInformativeWordsTFIDF(words);
+      nextIndex = 0; // reset index for smart scrub navigation
       status.textContent = "Done! You can now play and scrub through keywords.";
       console.log("Informative words:", informativeWords);
     };
@@ -89,38 +94,163 @@
           headers: { "Authorization": API_KEY }
         });
         statusCheck = await poll.json();
+        if (statusCheck.status === "error" || statusCheck.status === "failed") {
+          throw new Error(statusCheck.error || "Transcription failed");
+        }
       } while (statusCheck.status !== "completed");
 
-      return statusCheck.words.map(w => ({ text: w.text, start: w.start / 1000 }));
+      return statusCheck.words.map(w => ({ text: w.text, start: w.start / 1000, end: w.end ? w.end / 1000 : undefined }));
     }
 
-   
+    // --- TF-IDF scoring over time windows ---
+    function selectInformativeWordsTFIDF(words) {
+      if (!Array.isArray(words) || words.length === 0) return [];
+
+      // Normalize tokens and filter basic noise
+      const alpha = /[a-z]/i;
+      const tokens = words.map(w => ({
+        text: (w.text || '').toLowerCase().replace(/[^a-z'\-]/gi, ''),
+        start: w.start,
+        end: w.end
+      })).filter(w => w.text && alpha.test(w.text) && !commonWords.has(w.text));
+
+      if (tokens.length === 0) return [];
+
+      // Build time windows as pseudo-documents
+      const totalDuration = Math.max(...tokens.map(t => t.start));
+      const windowSizeSec = 10; // adjustable window size
+      const numWindows = Math.max(1, Math.ceil((totalDuration + 0.0001) / windowSizeSec));
+
+      /**
+       * df: number of windows that contain the term at least once
+       * tf: total count in entire transcript
+       */
+      const df = new Map();
+      const tf = new Map();
+
+      // Track which terms appear per window
+      const windowSets = Array.from({ length: numWindows }, () => new Set());
+      for (const t of tokens) {
+        // Term Frequency
+        tf.set(t.text, (tf.get(t.text) || 0) + 1);
+
+        // Document Frequency across windows
+        const idx = Math.min(numWindows - 1, Math.max(0, Math.floor(t.start / windowSizeSec)));
+        windowSets[idx].add(t.text);
+      }
+      for (const s of windowSets) {
+        for (const term of s) {
+          df.set(term, (df.get(term) || 0) + 1);
+        }
+      }
+
+      // Compute IDF with smoothing
+      const N = numWindows;
+      const idf = new Map();
+      for (const [term, dfCount] of df.entries()) {
+        idf.set(term, Math.log((N + 1) / (dfCount + 1)) + 1); // > 0
+      }
+
+      // Compute TF-IDF per term
+      const tfidf = new Map();
+      for (const [term, tfCount] of tf.entries()) {
+        const score = tfCount * (idf.get(term) || 0);
+        tfidf.set(term, score);
+      }
+
+      // Build distribution of scores to set a dynamic threshold (e.g., 75th percentile)
+      const scores = Array.from(tfidf.values()).filter(v => isFinite(v) && v > 0);
+      if (scores.length === 0) return tokens; // fallback: return all tokens (already stopword-filtered)
+      scores.sort((a, b) => a - b);
+      const p = 0.75;
+      const idx75 = Math.floor(p * (scores.length - 1));
+      const threshold = scores[idx75];
+
+      // Attach per-token score based on its term score; filter by threshold
+      const informative = tokens
+        .map(t => ({ ...t, score: tfidf.get(t.text) || 0 }))
+        .filter(t => t.score >= threshold)
+        .sort((a, b) => a.start - b.start);
+
+      // Map back to expected shape { text, start } for existing logic
+      return informative.map(({ text, start, end }) => ({ text, start, end }));
+    }
+
+   // TF-IDF --- END ---
+
     slider.oninput = () => {
       const sp = parseFloat(slider.value);
       label.textContent = sp.toFixed(1) + "x";
-      audio.playbackRate = sp;
+      fastSpeed = sp;
       if (sp > 2) {
+        // Enter smart-scrub mode: we will not speed up actual audio between words
         if (!timer) startSmartScrub();
-      } else stopSmartScrub();
+      } else {
+        // Exit scrub mode and restore normal playback control
+        stopSmartScrub();
+        audio.playbackRate = sp;
+        // If user lowered speed and wants normal listening, keep playing state unchanged
+      }
     };
 
     function startSmartScrub() {
+      // In smart-scrub mode, we do NOT speed up audio between words.
+      // We keep audio paused except when dwelling on an informative word at 1.0x.
+      audio.pause();
+      audio.playbackRate = 1.0;
+
       timer = setInterval(() => {
-        if (audio.paused) return;
-        const sp = audio.playbackRate;
-        if (sp <= 2) return stopSmartScrub();
-        const next = informativeWords.find(w => w.start > audio.currentTime);
-        if (next) {
+        // Keep running even if audio is paused; scrubbing is driven by timer + seeks
+        if (fastSpeed <= 2) return stopSmartScrub();
+        if (isDwelling) return; // wait until current dwell finishes
+
+        // Advance pointer to next informative word ahead of current time
+        while (nextIndex < informativeWords.length && informativeWords[nextIndex].start <= audio.currentTime) {
+          nextIndex++;
+        }
+        if (nextIndex >= informativeWords.length) return stopSmartScrub();
+
+        const next = informativeWords[nextIndex];
+
+        // Seek directly to the informative word
+        if (Math.abs(audio.currentTime - next.start) > 0.01) {
           audio.currentTime = next.start;
-          displayWord(next.text);
-        } else stopSmartScrub();
-      }, 400);
+        }
+
+        // Determine dwell length: prefer true word duration; fallback to 1000/fastSpeed
+        let dwellMs;
+        if (typeof next.end === 'number' && next.end > next.start) {
+          const durMs = (next.end - next.start) * 1000;
+          dwellMs = Math.max(60, Math.min(1600, durMs));
+        } else {
+          dwellMs = Math.max(60, 2000 / Math.max(0.1, fastSpeed));
+        }
+
+        // Start dwell: play at normal speed just for the word
+        isDwelling = true;
+        displayWord(next.text);
+        audio.playbackRate = 1.0;
+        audio.play().catch(() => {/* ignore autoplay restrictions; user likely interacted */});
+
+        clearTimeout(dwellTimeout);
+        dwellTimeout = setTimeout(() => {
+          // End dwell: pause again; do not play in-between audio
+          isDwelling = false;
+          audio.pause();
+          nextIndex++;
+        }, dwellMs);
+      }, Math.max(50, 1000 / Math.max(0.1, parseFloat(slider.value) || 1)));
     }
 
     function stopSmartScrub() {
       clearInterval(timer);
       timer = null;
+      clearTimeout(dwellTimeout);
+      isDwelling = false;
+      dwellTimeout = null;
       display.textContent = "";
+      // Do not force playback state here beyond rate; leave play/pause to the user
+      audio.playbackRate = Math.max(0.5, Math.min(4, parseFloat(slider.value) || 1));
     }
 
     function displayWord(w) {

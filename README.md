@@ -6,6 +6,6 @@ checklist
 
 1a. Still deciding between Vosk or a cloud api like google cloud speech to text api for task 1
 
-2a. There are language model libraries that look into the most informative or rare words but have not found any specific
+2a. There are TF-IDF libraries that measure the semantic weight of words in a corpus. But it will be easier to find measure the rarest word and out put it through the +2x speed
 
 3a. Haven't started

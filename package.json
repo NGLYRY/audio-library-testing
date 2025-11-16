@@ -1,0 +1,8 @@
+{
+  "name": "libraries-testing",
+  "homepage": "https://NGLYRY.github.io/libraries-testing/",
+  
+  "devDependencies": {
+    "gh-pages": "^6.3.0"
+  }
+}
