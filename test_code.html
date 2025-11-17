@@ -23,7 +23,7 @@
   <div id="status"></div>
 
   <script>
-    const API_KEY = "API_KEY_INSERT"; // replace this with your key https://www.assemblyai.com/
+    const API_KEY = "fae6aef01046408cb7e2c932adcf6e42";
     const uploadUrl = "https://api.assemblyai.com/v2/upload";
     const transcribeUrl = "https://api.assemblyai.com/v2/transcript";
 
@@ -34,10 +34,13 @@
     const status = document.getElementById('status');
     const fileInput = document.getElementById('audioFile');
 
-    let informativeWords = [];
+    let informativeWords = []; 
     let timer = null;
+    let isDwelling = false;
+    let dwellTimeout = null;
+    let fastSpeed = 1;
+    let nextIndex = 0;
 
-    // Basic common words
     const commonWords = new Set(["the","and","is","in","on","it","of","to","a","an","i","you","that","this"]);
 
     fileInput.onchange = async () => {
@@ -45,14 +48,13 @@
       if (!file) return;
       audio.src = URL.createObjectURL(file);
       status.textContent = "Uploading audio...";
-      
       const audioUrl = await uploadToAssembly(file);
       status.textContent = "Processing transcription...";
       
       const words = await getTranscript(audioUrl);
-      informativeWords = words.filter(w => !commonWords.has(w.text.toLowerCase()));
+      informativeWords = selectInformativeWordsTFIDF(words);
+      nextIndex = 0;
       status.textContent = "Done! You can now play and scrub through keywords.";
-      console.log("Informative words:", informativeWords);
     };
 
     async function uploadToAssembly(file) {
@@ -81,7 +83,6 @@
       });
       const job = await resp.json();
 
-      
       let statusCheck;
       do {
         await new Promise(r => setTimeout(r, 5000));
@@ -89,43 +90,166 @@
           headers: { "Authorization": API_KEY }
         });
         statusCheck = await poll.json();
+        if (statusCheck.status === "error" || statusCheck.status === "failed") {
+          throw new Error(statusCheck.error || "Transcription failed");
+        }
       } while (statusCheck.status !== "completed");
 
-      return statusCheck.words.map(w => ({ text: w.text, start: w.start / 1000 }));
+      return statusCheck.words.map(w => ({
+        text: w.text,
+        start: w.start / 1000,
+        end: w.end ? w.end / 1000 : undefined
+      }));
     }
 
-   
+    function selectInformativeWordsTFIDF(words) {
+      if (!Array.isArray(words) || words.length === 0) return [];
+      const alpha = /[a-z]/i;
+
+      const tokens = words.map(w => ({
+        text: (w.text || '').toLowerCase().replace(/[^a-z'\-]/gi, ''),
+        start: w.start,
+        end: w.end
+      })).filter(w => w.text && alpha.test(w.text) && !commonWords.has(w.text));
+
+      if (tokens.length === 0) return [];
+
+      const totalDuration = Math.max(...tokens.map(t => t.start));
+      const windowSizeSec = 10; 
+      const numWindows = Math.max(1, Math.ceil((totalDuration + 0.0001) / windowSizeSec));
+
+      const df = new Map();
+      const tf = new Map();
+      const windowSets = Array.from({ length: numWindows }, () => new Set());
+
+      for (const t of tokens) {
+        tf.set(t.text, (tf.get(t.text) || 0) + 1);
+        const idx = Math.min(numWindows - 1, Math.floor(t.start / windowSizeSec));
+        windowSets[idx].add(t.text);
+      }
+      for (const s of windowSets) {
+        for (const term of s) df.set(term, (df.get(term) || 0) + 1);
+      }
+
+      const N = numWindows;
+      const idf = new Map();
+      for (const [term, dfCount] of df.entries()) {
+        idf.set(term, Math.log((N + 1) / (dfCount + 1)) + 1);
+      }
+
+      const tfidf = new Map();
+      for (const [term, tfCount] of tf.entries()) {
+        tfidf.set(term, tfCount * (idf.get(term) || 0));
+      }
+
+      const scores = Array.from(tfidf.values()).filter(v => isFinite(v) && v > 0);
+      if (scores.length === 0) return tokens;
+
+      scores.sort((a, b) => a - b);
+      const threshold = scores[Math.floor(0.75 * (scores.length - 1))];
+
+      return tokens
+        .map(t => ({ ...t, score: tfidf.get(t.text) || 0 }))
+        .filter(t => t.score >= threshold)
+        .sort((a, b) => a.start - b.start)
+        .map(({ text, start, end }) => ({ text, start, end }));
+    }
+
     slider.oninput = () => {
       const sp = parseFloat(slider.value);
       label.textContent = sp.toFixed(1) + "x";
-      audio.playbackRate = sp;
+      fastSpeed = sp;
       if (sp > 2) {
         if (!timer) startSmartScrub();
-      } else stopSmartScrub();
+      } else {
+        stopSmartScrub();
+        audio.playbackRate = sp;
+      }
     };
 
-    function startSmartScrub() {
-      timer = setInterval(() => {
-        if (audio.paused) return;
-        const sp = audio.playbackRate;
-        if (sp <= 2) return stopSmartScrub();
-        const next = informativeWords.find(w => w.start > audio.currentTime);
-        if (next) {
+    async function startSmartScrub() {
+      audio.pause();
+      audio.playbackRate = 1.0;
+
+      timer = setInterval(async () => {
+        if (fastSpeed <= 2) return stopSmartScrub();
+        if (isDwelling) return;
+
+        while (nextIndex < informativeWords.length && informativeWords[nextIndex].start <= audio.currentTime) {
+          nextIndex++;
+        }
+        if (nextIndex >= informativeWords.length) return stopSmartScrub();
+
+        const next = informativeWords[nextIndex];
+        if (Math.abs(audio.currentTime - next.start) > 0.01) {
           audio.currentTime = next.start;
-          displayWord(next.text);
-        } else stopSmartScrub();
-      }, 400);
+        }
+
+        let dwellMs;
+        if (typeof next.end === 'number' && next.end > next.start) {
+          const durMs = (next.end - next.start) * 1000;
+          dwellMs = Math.max(60, Math.min(1600, durMs));
+        } else {
+          dwellMs = Math.max(60, 2000 / Math.max(0.1, fastSpeed));
+        }
+
+        isDwelling = true;
+        displayWord(next.text);
+
+        await new Promise(r => setTimeout(r, 30));
+        audio.playbackRate = 1.0;
+        audio.play().catch(() => {});
+
+        const tailTimeMs = 150;
+        let finalDwell = dwellMs + tailTimeMs;
+        finalDwell = Math.max(finalDwell, 120);
+
+        clearTimeout(dwellTimeout);
+        dwellTimeout = setTimeout(() => {
+          isDwelling = false;
+
+          fadeOutAudio(audio, () => {
+            audio.pause();
+            audio.volume = 1;
+            nextIndex++;
+          });
+
+        }, finalDwell);
+
+      }, Math.max(50, 1000 / Math.max(0.1, parseFloat(slider.value) || 1)));
     }
 
     function stopSmartScrub() {
       clearInterval(timer);
       timer = null;
+      clearTimeout(dwellTimeout);
+      isDwelling = false;
+      dwellTimeout = null;
       display.textContent = "";
+      audio.playbackRate = Math.max(0.5, Math.min(4, parseFloat(slider.value) || 1));
     }
 
     function displayWord(w) {
       display.textContent = w;
     }
+
+    function fadeOutAudio(audio, callback) {
+      const interval = 10;
+      const step = 0.05;
+      let volume = audio.volume;
+
+      const fade = setInterval(() => {
+        volume -= step;
+        if (volume <= 0) {
+          clearInterval(fade);
+          audio.volume = 1;
+          callback();
+        } else {
+          audio.volume = volume;
+        }
+      }, interval);
+    }
+
   </script>
 </body>
 </html>
