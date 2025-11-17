@@ -14,11 +14,15 @@
   <h1> Fast-Forward Audio Player</h1>
 
   <input type="file" id="audioFile" accept="audio/*"><br><br>
-  <audio id="audio" controls></audio><br>
+  <audio id="audio" controls src="mp3s/manwhothinks.mp3"></audio><br>
 
   <label>Playback Speed:</label>
   <input type="range" id="speed" min="0.5" max="4" step="0.1" value="1">
-  <span id="label">1.0x</span>
+  <span id="label">1.0x</span><br><br>
+  <button id="pauseBtn" style="display:none; padding:10px 20px; font-size:16px; cursor:pointer;">Pause Smart Scrub</button>
+  <div id="timeDisplay" style="margin-top:12px; font-family:monospace; color:#9bd;">
+    00:00 / 00:00
+  </div>
   <div id="keywordDisplay"></div>
   <div id="status"></div>
 
@@ -33,26 +37,201 @@
     const display = document.getElementById('keywordDisplay');
     const status = document.getElementById('status');
     const fileInput = document.getElementById('audioFile');
+    const pauseBtn = document.getElementById('pauseBtn');
+    const timeDisplay = document.getElementById('timeDisplay');
 
-  let informativeWords = []; 
+    // Web Audio API setup for smooth transitions
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const gainNode = audioContext.createGain();
+    const source = audioContext.createMediaElementSource(audio);
+    source.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+    gainNode.gain.value = 1;
+
+    // Smart-scrub playback via decoded buffer to avoid seek clicks
+    let smartBuffer = null;                 // Decoded AudioBuffer of current track
+    let smartSrc = null;                    // Current BufferSource for word playback
+    let smartGain = null;                   // Gain node for word envelope
+    let smartCleanupTimer = null;           // Cleanup timer after fade-out
+
+    async function decodeAudioFromBlob(blob) {
+      try {
+        const arrayBuffer = await blob.arrayBuffer();
+        return await audioContext.decodeAudioData(arrayBuffer);
+      } catch (e) {
+        console.error('Failed to decode audio blob', e);
+        return null;
+      }
+    }
+
+    async function decodeAudioFromUrl(url) {
+      try {
+        const resp = await fetch(url);
+        const blob = await resp.blob();
+        return await decodeAudioFromBlob(blob);
+      } catch (e) {
+        console.error('Failed to decode from URL', url, e);
+        return null;
+      }
+    }
+
+    function stopSmartSegment(fadeMs = 10) {
+      if (!smartSrc || !smartGain) return;
+      const now = audioContext.currentTime;
+      const fade = Math.max(0.005, (fadeMs || 10) / 1000);
+      try {
+        smartGain.gain.cancelScheduledValues(now);
+        // Ramp to 0 then stop shortly after
+        smartGain.gain.setValueAtTime(smartGain.gain.value, now);
+        smartGain.gain.linearRampToValueAtTime(0, now + fade);
+        clearTimeout(smartCleanupTimer);
+        smartCleanupTimer = setTimeout(() => {
+          try { smartSrc.stop(); } catch {}
+          try { smartSrc.disconnect(); } catch {}
+          try { smartGain.disconnect(); } catch {}
+          smartSrc = null;
+          smartGain = null;
+        }, fade * 1000 + 5);
+      } catch {}
+    }
+
+    function playSmartSegment(startSec, durationMs) {
+      if (!smartBuffer) return false;
+      // Ensure any previous segment is stopped cleanly
+      stopSmartSegment(8);
+      const durationSec = Math.max(0.03, (durationMs || 200) / 1000);
+      const offset = Math.max(0, Math.min(startSec || 0, smartBuffer.duration - 0.01));
+      if (offset >= smartBuffer.duration) return false;
+
+      const src = audioContext.createBufferSource();
+      const segGain = audioContext.createGain();
+      src.buffer = smartBuffer;
+      src.connect(segGain);
+      segGain.connect(audioContext.destination);
+
+      // Envelope: small attack/release to avoid clicks
+      const now = audioContext.currentTime;
+      const fade = Math.min(0.03, durationSec / 6);
+      segGain.gain.setValueAtTime(0, now);
+      segGain.gain.linearRampToValueAtTime(1, now + fade);
+      segGain.gain.setValueAtTime(1, now + Math.max(fade, durationSec - fade));
+      segGain.gain.linearRampToValueAtTime(0, now + durationSec);
+
+      try {
+        src.start(now, offset, Math.min(durationSec, Math.max(0.01, smartBuffer.duration - offset)));
+      } catch (e) {
+        console.error('Failed to start smart segment', e);
+        try { src.disconnect(); segGain.disconnect(); } catch {}
+        return false;
+      }
+
+      // Track for stop/fade
+      smartSrc = src;
+      smartGain = segGain;
+      // Auto cleanup
+      src.onended = () => {
+        try { src.disconnect(); segGain.disconnect(); } catch {}
+        if (smartSrc === src) smartSrc = null;
+        if (smartGain === segGain) smartGain = null;
+      };
+      return true;
+    }
+
+  let informativeWords = [];
     let timer = null;
     let isDwelling = false;
     let dwellTimeout = null;
     let fastSpeed = 1;
     let nextIndex = 0;
-
-    // Basic common words
+    let isSmartScrubPaused = false;    // Basic common words
     const commonWords = new Set(["the","and","is","in","on","it","of","to","a","an","i","you","that","this"]);
+
+    // Time formatting helpers
+    function formatTime(sec) {
+      if (!isFinite(sec) || sec < 0) sec = 0;
+      const m = Math.floor(sec / 60);
+      const s = Math.floor(sec % 60);
+      return `${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
+    }
+    function updateTimeDisplayUI(currentSec, totalSec) {
+      if (!timeDisplay) return;
+      const cur = formatTime(currentSec || 0);
+      const tot = formatTime(totalSec || audio.duration || 0);
+      timeDisplay.textContent = `${cur} / ${tot}`;
+    }
+
+    // Pause button functionality
+    pauseBtn.onclick = () => {
+      if (isSmartScrubPaused) {
+        // Resume
+        isSmartScrubPaused = false;
+        pauseBtn.textContent = "Pause Smart Scrub";
+        if (timer) {
+          // Audio will resume on next timer tick
+        }
+      } else {
+        // Pause
+        isSmartScrubPaused = true;
+        pauseBtn.textContent = "Resume Smart Scrub";
+        audio.pause();
+        // Stop any currently playing smart segment to avoid tails/clicks
+        stopSmartSegment(8);
+        clearTimeout(dwellTimeout);
+        isDwelling = false;
+        // Reset gain smoothly
+        gainNode.gain.cancelScheduledValues(audioContext.currentTime);
+        gainNode.gain.setValueAtTime(gainNode.gain.value, audioContext.currentTime);
+        gainNode.gain.linearRampToValueAtTime(1, audioContext.currentTime + 0.01);
+      }
+    };
+
+    // Load default file on startup
+    window.addEventListener('load', async () => {
+      const defaultFile = 'mp3s/manwhothinks.mp3';
+      try {
+        status.textContent = "Loading default audio...";
+        const response = await fetch(defaultFile);
+        const blob = await response.blob();
+        // Decode for smart-scrub playback
+        smartBuffer = await decodeAudioFromBlob(blob);
+        // Initialize time display with total duration
+        if (smartBuffer) updateTimeDisplayUI(0, smartBuffer.duration);
+        status.textContent = "Uploading audio...";
+        const audioUrl = await uploadToAssembly(blob);
+        status.textContent = "Processing transcription...";
+        
+        const words = await getTranscript(audioUrl);
+        
+        // Display full transcript in console
+        displayTranscriptInConsole(words);
+        
+        // Build informative words using TF-IDF over time windows
+        informativeWords = selectInformativeWordsTFIDF(words);
+        nextIndex = 0;
+        status.textContent = "Done! You can now play and scrub through keywords.";
+        console.log("Informative words:", informativeWords);
+      } catch (error) {
+        console.error("Error loading default file:", error);
+        status.textContent = "Default file loaded. Upload a file to transcribe.";
+      }
+    });
 
     fileInput.onchange = async () => {
       const file = fileInput.files[0];
       if (!file) return;
       audio.src = URL.createObjectURL(file);
+      // Decode for smart-scrub playback
+      smartBuffer = await decodeAudioFromBlob(file);
+      if (smartBuffer) updateTimeDisplayUI(0, smartBuffer.duration);
       status.textContent = "Uploading audio...";
       const audioUrl = await uploadToAssembly(file);
       status.textContent = "Processing transcription...";
       
       const words = await getTranscript(audioUrl);
+      
+      // Display full transcript in console
+      displayTranscriptInConsole(words);
+      
       // Build informative words using TF-IDF over time windows
       informativeWords = selectInformativeWordsTFIDF(words);
       nextIndex = 0; // reset index for smart scrub navigation
@@ -100,6 +279,43 @@
       } while (statusCheck.status !== "completed");
 
       return statusCheck.words.map(w => ({ text: w.text, start: w.start / 1000, end: w.end ? w.end / 1000 : undefined }));
+    }
+
+    // Display transcript in browser console
+    function displayTranscriptInConsole(words) {
+      if (!words || words.length === 0) {
+        console.warn('No words in transcript');
+        return;
+      }
+
+      console.group('📄 TRANSCRIPT');
+      console.log('%c━'.repeat(50), 'color: #ffd500');
+      
+      // Build full transcript text
+      const fullText = words.map(w => w.text).join(' ');
+      console.log('%c' + fullText, 'font-size: 14px; line-height: 1.6;');
+      
+      console.log('%c━'.repeat(50), 'color: #ffd500');
+      console.log(`📊 Statistics: ${words.length} words`);
+      console.groupEnd();
+
+      // Word-by-word breakdown
+      console.group('📝 Word-by-Word Transcript (with timestamps)');
+      console.log('%c━'.repeat(50), 'color: #ffd500');
+      
+      words.forEach((word, index) => {
+        const startTime = (word.start / 1000).toFixed(2);
+        const endTime = word.end ? (word.end / 1000).toFixed(2) : '?';
+        const confidence = word.confidence ? `${(word.confidence * 100).toFixed(0)}%` : 'N/A';
+        
+        console.log(`[${startTime}s - ${endTime}s] ${word.text} (${confidence})`);
+        
+        // Add spacing every 10 words
+        if ((index + 1) % 10 === 0) console.log('');
+      });
+      
+      console.log('%c━'.repeat(50), 'color: #ffd500');
+      console.groupEnd();
     }
 
     // --- TF-IDF scoring over time windows ---
@@ -198,11 +414,18 @@
       // We keep audio paused except when dwelling on an informative word at 1.0x.
       audio.pause();
       audio.playbackRate = 1.0;
+      // Ensure audio context is running for buffer playback
+      if (audioContext.state === 'suspended') {
+        audioContext.resume().catch(()=>{});
+      }
+      pauseBtn.style.display = 'inline-block';
+      isSmartScrubPaused = false;
+      pauseBtn.textContent = "Pause Smart Scrub";
 
       timer = setInterval(() => {
         // Keep running even if audio is paused; scrubbing is driven by timer + seeks
         if (fastSpeed <= 2) return stopSmartScrub();
-        if (isDwelling) return; // wait until current dwell finishes
+        if (isDwelling || isSmartScrubPaused) return; // wait until current dwell finishes or paused
 
         // Advance pointer to next informative word ahead of current time
         while (nextIndex < informativeWords.length && informativeWords[nextIndex].start <= audio.currentTime) {
@@ -211,11 +434,6 @@
         if (nextIndex >= informativeWords.length) return stopSmartScrub();
 
         const next = informativeWords[nextIndex];
-
-        // Seek directly to the informative word
-        if (Math.abs(audio.currentTime - next.start) > 0.01) {
-          audio.currentTime = next.start;
-        }
 
         // Determine dwell length: prefer true word duration; fallback to 1000/fastSpeed
         let dwellMs;
@@ -226,17 +444,41 @@
           dwellMs = Math.max(60, 2000 / Math.max(0.1, fastSpeed));
         }
 
-        // Start dwell: play at normal speed just for the word
+        // Start dwell using decoded buffer (no HTMLAudio seek) to avoid clicks
         isDwelling = true;
         displayWord(next.text);
         audio.playbackRate = 1.0;
-        audio.play().catch(() => {/* ignore autoplay restrictions; user likely interacted */});
+        
+        // Ensure we have a decoded buffer; if not, try to decode current src lazily
+        if (!smartBuffer && audio.src) {
+          decodeAudioFromUrl(audio.src).then(buf => { smartBuffer = buf; });
+        }
+        
+        // Update native control progress and UI time to the word's timestamp
+        try { audio.currentTime = next.start; } catch {}
+        updateTimeDisplayUI(next.start, smartBuffer ? smartBuffer.duration : audio.duration);
+
+        // Play the word segment with built-in envelope
+        const ok = playSmartSegment(next.start, dwellMs);
+        if (!ok) {
+          // Fallback: if buffer unavailable, at least avoid loud click by muting briefly
+          const fadeTime = 0.01;
+          gainNode.gain.cancelScheduledValues(audioContext.currentTime);
+          gainNode.gain.setValueAtTime(gainNode.gain.value, audioContext.currentTime);
+          gainNode.gain.linearRampToValueAtTime(0, audioContext.currentTime + fadeTime);
+          setTimeout(() => {
+            audio.currentTime = next.start;
+            gainNode.gain.setValueAtTime(0, audioContext.currentTime);
+            gainNode.gain.linearRampToValueAtTime(1, audioContext.currentTime + fadeTime);
+            audio.play().catch(()=>{});
+          }, fadeTime * 1000);
+        }
 
         clearTimeout(dwellTimeout);
         dwellTimeout = setTimeout(() => {
-          // End dwell: pause again; do not play in-between audio
+          // End dwell: stop segment (with quick fade) and advance
+          stopSmartSegment(8);
           isDwelling = false;
-          audio.pause();
           nextIndex++;
         }, dwellMs);
       }, Math.max(50, 1000 / Math.max(0.1, parseFloat(slider.value) || 1)));
@@ -249,6 +491,14 @@
       isDwelling = false;
       dwellTimeout = null;
       display.textContent = "";
+      pauseBtn.style.display = 'none';
+      isSmartScrubPaused = false;
+      // Stop any smart segment playback
+      stopSmartSegment(8);
+      // Reset gain to full volume smoothly
+      gainNode.gain.cancelScheduledValues(audioContext.currentTime);
+      gainNode.gain.setValueAtTime(gainNode.gain.value, audioContext.currentTime);
+      gainNode.gain.linearRampToValueAtTime(1, audioContext.currentTime + 0.01);
       // Do not force playback state here beyond rate; leave play/pause to the user
       audio.playbackRate = Math.max(0.5, Math.min(4, parseFloat(slider.value) || 1));
     }

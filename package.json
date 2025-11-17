@@ -1,7 +1,13 @@
 {
   "name": "libraries-testing",
   "homepage": "https://NGLYRY.github.io/libraries-testing/",
-  
+  "type": "module",
+  "scripts": {
+    "transcribe": "node transcribe.js"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  },
   "devDependencies": {
     "gh-pages": "^6.3.0"
   }
