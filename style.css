@@ -1,0 +1,120 @@
+@import url('https://fonts.googleapis.com/css?family=Lato&display=swap');
+
+
+.progress-container {
+  background: #ffbfbf;
+  border-radius: 5px;
+  cursor: pointer;
+  margin: 10px 0;
+  height: 4px;
+  width: 100%;
+}
+
+.progress {
+  background-color: #3249b1;
+  border-radius: 5px;
+  height: 100%;
+  width: 0%;
+  transition: width 0.1s linear;
+}
+
+.navigation {
+  /* height: 100vh; */
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.action-btn {
+  background-color: #edb2b2;
+  border: 0;
+  color: #000000;
+  font-size: 20px;
+  cursor: pointer;
+  padding: 10px;
+  margin: 0 20px;
+}
+
+.action-btn.action-btn-big {
+  color: #000000;
+  font-size: 30px;
+}
+
+.action-btn:focus {
+  outline: 0;
+}
+
+.time-display {
+  text-align: center;
+  margin: 10px 0;
+  font-family: 'Lato', sans-serif;
+  font-size: 14px;
+  color: #333;
+}
+
+.backward-control {
+  text-align: center;
+  margin: 10px 0;
+  font-family: 'Lato', sans-serif;
+}
+
+.backward-control label {
+  display: block;
+  margin-bottom: 5px;
+  font-size: 14px;
+  color: #333;
+}
+
+.backward-control input[type="number"] {
+  width: 60px;
+  padding: 5px;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  text-align: center;
+  font-size: 14px;
+}
+
+.backward-params {
+  margin: 15px 0;
+  padding: 15px;
+  background-color: #f9f9f9;
+  border-radius: 8px;
+  border: 1px solid #e0e0e0;
+  font-family: 'Lato', sans-serif;
+}
+
+.backward-params h3 {
+  margin: 0 0 15px 0;
+  color: #333;
+  font-size: 16px;
+  text-align: center;
+}
+
+.param-group {
+  margin: 10px 0;
+}
+
+.param-group label {
+  display: block;
+  margin-bottom: 5px;
+  font-weight: bold;
+  color: #555;
+  font-size: 14px;
+}
+
+.param-group input[type="range"] {
+  width: 100%;
+  margin: 5px 0;
+}
+
+/* Speed slider specific styling */
+.speed-control input[type="range"] {
+  width: 100%;
+  margin: 5px 0;
+  height: 8px;
+}
+
+.param-group span {
+  color: #007bff;
+  font-weight: bold;
+}

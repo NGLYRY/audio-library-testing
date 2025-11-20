@@ -8,6 +8,21 @@
     input[type="range"] { width:60%; margin-top:20px; }
     #keywordDisplay { margin-top:30px; font-size:1.6em; color:#ffd500; }
     #status { margin-top:20px; font-style:italic; }
+    #progressBar { 
+      width:60%; 
+      height:8px; 
+      background:#333; 
+      margin:20px auto; 
+      border-radius:4px; 
+      overflow:hidden; 
+      position:relative;
+    }
+    #progressFill { 
+      height:100%; 
+      background:linear-gradient(90deg, #ffd500, #ff8c00); 
+      width:0%; 
+      transition:width 0.1s linear;
+    }
   </style>
 </head>
 <body>
@@ -138,6 +153,7 @@
     }
 
   let informativeWords = [];
+    let allTranscriptWords = [];  // Cache of full transcript for recalculating with different speeds
     let timer = null;
     let isDwelling = false;
     let dwellTimeout = null;
@@ -166,9 +182,6 @@
         // Resume
         isSmartScrubPaused = false;
         pauseBtn.textContent = "Pause Smart Scrub";
-        if (timer) {
-          // Audio will resume on next timer tick
-        }
       } else {
         // Pause
         isSmartScrubPaused = true;
@@ -185,6 +198,37 @@
       }
     };
 
+    // Shared function to load and process audio file
+    async function loadAndProcessAudio(blob) {
+      try {
+        // Decode for smart-scrub playback
+        smartBuffer = await decodeAudioFromBlob(blob);
+        // Initialize time display with total duration
+        if (smartBuffer) updateTimeDisplayUI(0, smartBuffer.duration);
+        
+        status.textContent = "Uploading audio...";
+        const audioUrl = await uploadToAssembly(blob);
+        
+        status.textContent = "Processing transcription...";
+        const words = await getTranscript(audioUrl);
+        
+        // Display full transcript in console
+        displayTranscriptInConsole(words);
+        
+        // Cache full transcript for recalculating with different speeds
+        allTranscriptWords = words;
+        
+        // Build informative words using TF-IDF over time windows
+        informativeWords = selectInformativeWordsTFIDF(words, fastSpeed);
+        nextIndex = 0;
+        status.textContent = "Done! You can now play and scrub through keywords.";
+        console.log("Informative words:", informativeWords);
+      } catch (error) {
+        console.error("Error processing audio:", error);
+        status.textContent = "Error processing audio. Please try again.";
+      }
+    }
+
     // Load default file on startup
     window.addEventListener('load', async () => {
       const defaultFile = 'mp3s/manwhothinks.mp3';
@@ -192,24 +236,7 @@
         status.textContent = "Loading default audio...";
         const response = await fetch(defaultFile);
         const blob = await response.blob();
-        // Decode for smart-scrub playback
-        smartBuffer = await decodeAudioFromBlob(blob);
-        // Initialize time display with total duration
-        if (smartBuffer) updateTimeDisplayUI(0, smartBuffer.duration);
-        status.textContent = "Uploading audio...";
-        const audioUrl = await uploadToAssembly(blob);
-        status.textContent = "Processing transcription...";
-        
-        const words = await getTranscript(audioUrl);
-        
-        // Display full transcript in console
-        displayTranscriptInConsole(words);
-        
-        // Build informative words using TF-IDF over time windows
-        informativeWords = selectInformativeWordsTFIDF(words);
-        nextIndex = 0;
-        status.textContent = "Done! You can now play and scrub through keywords.";
-        console.log("Informative words:", informativeWords);
+        await loadAndProcessAudio(blob);
       } catch (error) {
         console.error("Error loading default file:", error);
         status.textContent = "Default file loaded. Upload a file to transcribe.";
@@ -220,23 +247,7 @@
       const file = fileInput.files[0];
       if (!file) return;
       audio.src = URL.createObjectURL(file);
-      // Decode for smart-scrub playback
-      smartBuffer = await decodeAudioFromBlob(file);
-      if (smartBuffer) updateTimeDisplayUI(0, smartBuffer.duration);
-      status.textContent = "Uploading audio...";
-      const audioUrl = await uploadToAssembly(file);
-      status.textContent = "Processing transcription...";
-      
-      const words = await getTranscript(audioUrl);
-      
-      // Display full transcript in console
-      displayTranscriptInConsole(words);
-      
-      // Build informative words using TF-IDF over time windows
-      informativeWords = selectInformativeWordsTFIDF(words);
-      nextIndex = 0; // reset index for smart scrub navigation
-      status.textContent = "Done! You can now play and scrub through keywords.";
-      console.log("Informative words:", informativeWords);
+      await loadAndProcessAudio(file);
     };
 
     async function uploadToAssembly(file) {
@@ -304,8 +315,9 @@
       console.log('%c━'.repeat(50), 'color: #ffd500');
       
       words.forEach((word, index) => {
-        const startTime = (word.start / 1000).toFixed(2);
-        const endTime = word.end ? (word.end / 1000).toFixed(2) : '?';
+        // word.start and word.end are already in seconds (converted in getTranscript)
+        const startTime = word.start.toFixed(2);
+        const endTime = word.end ? word.end.toFixed(2) : '?';
         const confidence = word.confidence ? `${(word.confidence * 100).toFixed(0)}%` : 'N/A';
         
         console.log(`[${startTime}s - ${endTime}s] ${word.text} (${confidence})`);
@@ -319,7 +331,7 @@
     }
 
     // --- TF-IDF scoring over time windows ---
-    function selectInformativeWordsTFIDF(words) {
+    function selectInformativeWordsTFIDF(words, speed = 1) {
       if (!Array.isArray(words) || words.length === 0) return [];
 
       // Normalize tokens and filter basic noise
@@ -374,11 +386,16 @@
         tfidf.set(term, score);
       }
 
-      // Build distribution of scores to set a dynamic threshold (e.g., 75th percentile)
+      // Build distribution of scores to set a dynamic threshold based on speed
       const scores = Array.from(tfidf.values()).filter(v => isFinite(v) && v > 0);
       if (scores.length === 0) return tokens; // fallback: return all tokens (already stopword-filtered)
       scores.sort((a, b) => a - b);
-      const p = 0.75;
+      
+      // Dynamic percentile based on playback speed
+      // At 2.1x: ~75th percentile (top 25% words)
+      // At 3x: ~85th percentile (top 15% words)
+      // At 4x: ~92th percentile (top 8% words)
+      const p = Math.min(0.95, 0.50 + (speed - 2) * 0.15);
       const idx75 = Math.floor(p * (scores.length - 1));
       const threshold = scores[idx75];
 
@@ -399,7 +416,15 @@
       label.textContent = sp.toFixed(1) + "x";
       fastSpeed = sp;
       if (sp > 2) {
-        // Enter smart-scrub mode: we will not speed up actual audio between words
+        // Enter smart-scrub mode: recalculate informative words with new speed threshold
+        if (allTranscriptWords.length > 0) {
+          informativeWords = selectInformativeWordsTFIDF(allTranscriptWords, sp);
+          // Reset index to find next word from current position
+          nextIndex = 0;
+          while (nextIndex < informativeWords.length && informativeWords[nextIndex].start <= audio.currentTime) {
+            nextIndex++;
+          }
+        }
         if (!timer) startSmartScrub();
       } else {
         // Exit scrub mode and restore normal playback control
@@ -422,6 +447,7 @@
       isSmartScrubPaused = false;
       pauseBtn.textContent = "Pause Smart Scrub";
 
+      // Use a shorter fixed interval and check speed dynamically inside
       timer = setInterval(() => {
         // Keep running even if audio is paused; scrubbing is driven by timer + seeks
         if (fastSpeed <= 2) return stopSmartScrub();
@@ -435,18 +461,20 @@
 
         const next = informativeWords[nextIndex];
 
-        // Determine dwell length: prefer true word duration; fallback to 1000/fastSpeed
+        // Determine dwell length: keep words understandable with minimum duration
         let dwellMs;
         if (typeof next.end === 'number' && next.end > next.start) {
           const durMs = (next.end - next.start) * 1000;
-          dwellMs = Math.max(60, Math.min(1600, durMs));
+          // Keep full word duration for clarity, but ensure reasonable bounds
+          dwellMs = Math.max(200, Math.min(1200, durMs));
         } else {
-          dwellMs = Math.max(60, 2000 / Math.max(0.1, fastSpeed));
+          // Fallback to reasonable default
+          dwellMs = 400;
         }
 
         // Start dwell using decoded buffer (no HTMLAudio seek) to avoid clicks
         isDwelling = true;
-        displayWord(next.text);
+        display.textContent = next.text;
         audio.playbackRate = 1.0;
         
         // Ensure we have a decoded buffer; if not, try to decode current src lazily
@@ -481,7 +509,7 @@
           isDwelling = false;
           nextIndex++;
         }, dwellMs);
-      }, Math.max(50, 1000 / Math.max(0.1, parseFloat(slider.value) || 1)));
+      }, 50); // Fixed 50ms interval for responsive speed changes
     }
 
     function stopSmartScrub() {
@@ -501,10 +529,6 @@
       gainNode.gain.linearRampToValueAtTime(1, audioContext.currentTime + 0.01);
       // Do not force playback state here beyond rate; leave play/pause to the user
       audio.playbackRate = Math.max(0.5, Math.min(4, parseFloat(slider.value) || 1));
-    }
-
-    function displayWord(w) {
-      display.textContent = w;
     }
   </script>
 </body>
