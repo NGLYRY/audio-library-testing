@@ -276,7 +276,6 @@
       });
       const job = await resp.json();
 
-      
       let statusCheck;
       do {
         await new Promise(r => setTimeout(r, 5000));
@@ -284,6 +283,9 @@
           headers: { "Authorization": API_KEY }
         });
         statusCheck = await poll.json();
+        if (statusCheck.status === "error" || statusCheck.status === "failed") {
+          throw new Error(statusCheck.error || "Transcription failed");
+        }
         if (statusCheck.status === "error" || statusCheck.status === "failed") {
           throw new Error(statusCheck.error || "Transcription failed");
         }
@@ -415,6 +417,7 @@
       const sp = parseFloat(slider.value);
       label.textContent = sp.toFixed(1) + "x";
       fastSpeed = sp;
+      fastSpeed = sp;
       if (sp > 2) {
         // Enter smart-scrub mode: recalculate informative words with new speed threshold
         if (allTranscriptWords.length > 0) {
@@ -518,6 +521,9 @@
       clearTimeout(dwellTimeout);
       isDwelling = false;
       dwellTimeout = null;
+      clearTimeout(dwellTimeout);
+      isDwelling = false;
+      dwellTimeout = null;
       display.textContent = "";
       pauseBtn.style.display = 'none';
       isSmartScrubPaused = false;
@@ -530,6 +536,24 @@
       // Do not force playback state here beyond rate; leave play/pause to the user
       audio.playbackRate = Math.max(0.5, Math.min(4, parseFloat(slider.value) || 1));
     }
+
+    function fadeOutAudio(audio, callback) {
+      const interval = 10;
+      const step = 0.05;
+      let volume = audio.volume;
+
+      const fade = setInterval(() => {
+        volume -= step;
+        if (volume <= 0) {
+          clearInterval(fade);
+          audio.volume = 1;
+          callback();
+        } else {
+          audio.volume = volume;
+        }
+      }, interval);
+    }
+
   </script>
 </body>
 </html>
