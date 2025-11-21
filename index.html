@@ -14,13 +14,20 @@
   <h1> Fast-Forward Audio Player</h1>
 
   <input type="file" id="audioFile" accept="audio/*"><br><br>
+
+
   <audio id="audio" controls src="mp3s/manwhothinks.mp3"></audio><br>
 
   <label>Playback Speed:</label>
   <input type="range" id="speed" min="0.5" max="4" step="0.1" value="1">
   <span id="label">1.0x</span><br><br>
+  <label>Semantic Threshold:</label>
+  <input type="range" id="thresholdSlider" min="50" max="90" step="1" value="75">
+  <span id="thresholdLabel">75th percentile</span><br><br>
+  
   <button id="pauseBtn" style="display:none; padding:10px 20px; font-size:16px; cursor:pointer;">Pause Smart Scrub</button>
   <div id="keywordDisplay"></div>
+
   <div id="status"></div>
 
   <script>
@@ -36,6 +43,9 @@
     const fileInput = document.getElementById('audioFile');
     const pauseBtn = document.getElementById('pauseBtn');
     const timeDisplay = document.getElementById('timeDisplay');
+    const thresholdSlider = document.getElementById('thresholdSlider');
+    const thresholdLabel = document.getElementById('thresholdLabel');
+    
 
     // Web Audio API setup for smooth transitions
     const audioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -141,7 +151,10 @@
     let dwellTimeout = null;
     let fastSpeed = 1;
     let nextIndex = 0;
-    let isSmartScrubPaused = false;    // Basic common words
+    let isSmartScrubPaused = false;
+    let manualThresholdPercentile = null; // User override for threshold
+    let hasUserAdjustedThreshold = false; // Track if user manually set threshold
+    // Basic common words
     const commonWords = new Set(["the","and","is","in","on","it","of","to","a","an","i","you","that","this"]);
 
     // Time formatting helpers
@@ -313,7 +326,7 @@
     }
 
     // --- TF-IDF scoring over time windows ---
-    function selectInformativeWordsTFIDF(words, speed = 1) {
+    function selectInformativeWordsTFIDF(words, speed = 1, overridePercentile = null) {
       if (!Array.isArray(words) || words.length === 0) return [];
 
       // Normalize tokens and filter basic noise
@@ -373,11 +386,14 @@
       if (scores.length === 0) return tokens; // fallback: return all tokens (already stopword-filtered)
       scores.sort((a, b) => a - b);
       
-      // Dynamic percentile based on playback speed
+      // Dynamic percentile based on playback speed (unless overridden)
       // At 2.1x: ~75th percentile (top 25% words)
       // At 3x: ~85th percentile (top 15% words)
       // At 4x: ~92th percentile (top 8% words)
-      const p = Math.min(0.95, 0.50 + (speed - 2) * 0.15);
+      let p = Math.min(0.95, 0.50 + (speed - 2) * 0.15);
+      if (overridePercentile !== null && overridePercentile >= 0.50 && overridePercentile <= 0.95) {
+        p = overridePercentile; // Use user's manual override
+      }
       const idx75 = Math.floor(p * (scores.length - 1));
       const threshold = scores[idx75];
 
@@ -393,27 +409,50 @@
 
    // TF-IDF --- END ---
 
+    // Helper to recalculate informative words with current settings
+    function recalcInformative(resetIndexToCurrent = true) {
+      if (allTranscriptWords.length === 0) return;
+      informativeWords = selectInformativeWordsTFIDF(
+        allTranscriptWords,
+        fastSpeed,
+        hasUserAdjustedThreshold ? manualThresholdPercentile : null
+      );
+      if (resetIndexToCurrent) {
+        nextIndex = 0;
+        while (nextIndex < informativeWords.length && informativeWords[nextIndex].start <= audio.currentTime) {
+          nextIndex++;
+        }
+      }
+    }
+
+    // Update threshold slider UI based on speed (if user hasn't manually adjusted)
+    function updateThresholdUIFromSpeed() {
+      const dynamicP = Math.min(0.95, 0.50 + (fastSpeed - 2) * 0.15);
+      thresholdSlider.value = Math.round(dynamicP * 100);
+      thresholdLabel.textContent = `${Math.round(dynamicP * 100)}th percentile`;
+    }
+
     slider.oninput = () => {
       const sp = parseFloat(slider.value);
       label.textContent = sp.toFixed(1) + "x";
       fastSpeed = sp;
+      updateThresholdUIFromSpeed(); // Update threshold slider to match speed
       if (sp > 2) {
-        // Enter smart-scrub mode: recalculate informative words with new speed threshold
-        if (allTranscriptWords.length > 0) {
-          informativeWords = selectInformativeWordsTFIDF(allTranscriptWords, sp);
-          // Reset index to find next word from current position
-          nextIndex = 0;
-          while (nextIndex < informativeWords.length && informativeWords[nextIndex].start <= audio.currentTime) {
-            nextIndex++;
-          }
-        }
+        recalcInformative(true);
         if (!timer) startSmartScrub();
       } else {
-        // Exit scrub mode and restore normal playback control
         stopSmartScrub();
         audio.playbackRate = sp;
-        // If user lowered speed and wants normal listening, keep playing state unchanged
       }
+    };
+
+    // Semantic threshold slider handler
+    thresholdSlider.oninput = () => {
+      const val = parseInt(thresholdSlider.value, 10); // 50-95
+      manualThresholdPercentile = val / 100;
+      thresholdLabel.textContent = `${val}th percentile`;
+      hasUserAdjustedThreshold = true;
+      recalcInformative(false); // Recalc without resetting index
     };
 
     function startSmartScrub() {
