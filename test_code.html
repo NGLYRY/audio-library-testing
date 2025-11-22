@@ -60,12 +60,16 @@
   let isDwelling = false;
   let nextIndex = 0;
   let fastSpeed = 1;
+  let scrubLock = false;       // prevents overlapping async runs
 
   const commonWords = new Set(["the","and","is","in","on","it","of","to","a","an","i","you","that","this"]);
 
   /***********************
    * Helpers: Upload & Transcribe
    ***********************/
+  // initialize label
+  thLabel.textContent = parseFloat(tfidfSlider.value).toFixed(2);
+
   fileInput.onchange = async () => {
     const file = fileInput.files[0];
     if (!file) return;
@@ -108,23 +112,24 @@
       })
     });
     const job = await resp.json();
-    if (!job.id) throw new Error("Transcription job failed to start");
+    if (!job || !job.id) throw new Error("Transcription job failed to start");
 
     let statusCheck;
     do {
       await new Promise(r => setTimeout(r, 3000));
       const poll = await fetch(`${transcribeUrl}/${job.id}`, { headers: { "Authorization": API_KEY } });
       statusCheck = await poll.json();
+      if (!statusCheck) throw new Error("Transcription poll failed");
       if (statusCheck.status === "error" || statusCheck.status === "failed") {
         throw new Error(statusCheck.error || "Transcription failed");
       }
     } while (statusCheck.status !== "completed");
 
-    // Map to seconds
-    return (statusCheck.words || []).map(w => ({
+    const words = Array.isArray(statusCheck.words) ? statusCheck.words : [];
+    return words.map(w => ({
       text: w.text,
-      start: w.start / 1000,
-      end: w.end ? w.end / 1000 : undefined
+      start: (w.start || 0) / 1000,
+      end: (typeof w.end === 'number') ? w.end / 1000 : undefined
     }));
   }
 
@@ -150,6 +155,7 @@
     const df = new Map(), tf = new Map();
     const windowSets = Array.from({ length: numWindows }, () => new Set());
 
+    // populate tf and windowSets
     for (const t of tokens) {
       tf.set(t.text, (tf.get(t.text) || 0) + 1);
       const idx = Math.min(numWindows - 1, Math.floor(t.start / windowSizeSec));
@@ -168,7 +174,10 @@
     }
 
     const scores = Array.from(tfidf.values()).filter(v => isFinite(v) && v > 0);
-    if (scores.length === 0) return tokens;
+    if (scores.length === 0) {
+      // fallback: return tokens (already filtered for stopwords)
+      return tokens.map(({ text, start, end }) => ({ text, start, end }));
+    }
 
     scores.sort((a, b) => a - b);
     const userT = parseFloat(document.getElementById("tfidfThreshold").value || 0.75);
@@ -213,7 +222,7 @@
    * Smooth seek helper (promises-based)
    ***********************/
   function smoothSeek(audioEl, targetTime, opts = {}) {
-    const maxStep = opts.step || 0.03; // seconds per frame change
+    const maxStep = opts.step || 0.03; // seconds per step
     const frameMs = opts.frameMs || 8;
     return new Promise(resolve => {
       const diff = targetTime - audioEl.currentTime;
@@ -237,7 +246,7 @@
   }
 
   /***********************
-   * Fade helpers (200ms default)
+   * Fade helpers (200ms default) — restore prior volume after fade out
    ***********************/
   function fadeInAudio(audioEl, durationMs = 200) {
     try { audioEl.volume = 0; } catch { audioEl.volume = 1; }
@@ -256,101 +265,106 @@
   }
 
   function fadeOutAudio(audioEl, durationMs = 200, callback = () => {}) {
+    const originalVol = Math.max(0, Math.min(1, audioEl.volume || 1));
     const steps = 20;
     const stepTime = Math.max(6, durationMs / steps);
-    let v = Math.max(0, Math.min(1, audioEl.volume || 1));
+    let v = originalVol;
     const ramp = setInterval(() => {
-      v -= 1 / steps;
+      v -= originalVol / steps;
       if (v <= 0) {
-        audioEl.volume = 1; // reset expected base volume for next play
         clearInterval(ramp);
+        audioEl.volume = originalVol; // restore for next time
         callback();
       } else {
-        audioEl.volume = Math.max(0, Math.min(1, v));
+        audioEl.volume = Math.max(0, Math.min(originalVol, v));
       }
     }, stepTime);
   }
 
- 
+    
   async function startSmartScrub() {
     // Pause regular playback and enforce playbackRate = 1 while dwelling
     audio.pause();
     audio.playbackRate = 1.0;
 
-    // Ensure we have words
     if (!informativeWords || informativeWords.length === 0) {
       status.textContent = "No informative words selected.";
       return;
     }
 
+    // timer tick drives the scrubbing loop; guard with scrubLock to avoid overlap
     timer = setInterval(async () => {
       if (fastSpeed <= 2) return stopSmartScrub();
-      if (isDwelling) return;
+      if (isDwelling || scrubLock) return;
+      scrubLock = true;
 
-      // Advance nextIndex to first informative word strictly after currentTime
-      while (nextIndex < informativeWords.length && informativeWords[nextIndex].start <= audio.currentTime + 0.01) {
-        nextIndex++;
-      }
-      if (nextIndex >= informativeWords.length) return stopSmartScrub();
-
-      const next = informativeWords[nextIndex];
-
-      // Compute start earlier and extended tail
-      const earlyMs = 200;
-      const lateMs = 200;
-      const earlyStart = Math.max(0, (next.start || 0) - earlyMs / 1000);
-
-      // Smooth seek to earlyStart to avoid clicks
-      await smoothSeek(audio, earlyStart);
-
-      // Compute dwell: play length covering the word body + extensions
-      let dwellMs;
-      if (typeof next.end === 'number' && next.end > next.start) {
-        const durMs = (next.end - next.start) * 1000;
-        // ensure a reasonable range for the word body
-        dwellMs = Math.max(80, Math.min(2000, durMs));
-      } else {
-        // fallback dwell if no end info
-        dwellMs = Math.max(80, 1200 / Math.max(0.1, fastSpeed));
-      }
-
-      const finalDwell = dwellMs + earlyMs + lateMs; // we include early start so total audible time covers pre & post tails
-
-      // Start dwelling: play at normal rate with fade-in
-      isDwelling = true;
-      displayWord(next.text);
       try {
-        audio.playbackRate = 1.0;
-        // Slight delay to let the browser process the seek
-        await new Promise(r => setTimeout(r, 8));
-        audio.play().catch(() => {});
-      } catch (err) {
-        console.warn("play error", err);
-      }
-
-      // Apply fade-in over earlyMs (but ensure it doesn't exceed finalDwell)
-      fadeInAudio(audio, Math.min(200, finalDwell));
-
-      // Clear any previous dwell timer and set a new one
-      clearTimeout(dwellTimeout);
-      dwellTimeout = setTimeout(() => {
-        // On dwell end, fade out then pause and advance
-        fadeOutAudio(audio, Math.min(200, finalDwell / 3), () => {
-          try { audio.pause(); } catch(e) {}
-          isDwelling = false;
+        // Advance nextIndex to first informative word strictly after currentTime
+        while (nextIndex < informativeWords.length && informativeWords[nextIndex].start <= audio.currentTime + 0.01) {
           nextIndex++;
-        });
-      }, Math.max(80, finalDwell));
+        }
+        if (nextIndex >= informativeWords.length) {
+          return stopSmartScrub();
+        }
 
+        const next = informativeWords[nextIndex];
+
+        // Compute start earlier and extended tail
+        const earlyMs = 200;
+        const lateMs = 200;
+        const earlyStart = Math.max(0, (next.start || 0) - earlyMs / 1000);
+
+        // Smooth seek to earlyStart to avoid clicks
+        await smoothSeek(audio, earlyStart);
+
+        // Compute dwell: play length covering the word body + extensions
+        let dwellMs;
+        if (typeof next.end === 'number' && next.end > next.start) {
+          const durMs = (next.end - next.start) * 1000;
+          dwellMs = Math.max(80, Math.min(2000, durMs));
+        } else {
+          dwellMs = Math.max(80, 1200 / Math.max(0.1, fastSpeed));
+        }
+
+        const finalDwell = dwellMs + earlyMs + lateMs;
+
+        // Start dwelling: play at normal rate with fade-in
+        isDwelling = true;
+        displayWord(next.text);
+
+        // Ensure we allow the browser to settle after seek
+        await new Promise(r => setTimeout(r, 8));
+        audio.playbackRate = 1.0;
+        audio.play().catch(() => { /* ignore autoplay restrictions */ });
+
+        // fade in over earlyMs or finalDwell if shorter
+        fadeInAudio(audio, Math.min(200, finalDwell));
+
+        // schedule end-of-dwell: fade out then pause and advance
+        clearTimeout(dwellTimeout);
+        dwellTimeout = setTimeout(() => {
+          fadeOutAudio(audio, Math.min(200, Math.max(80, finalDwell / 3)), () => {
+            try { audio.pause(); } catch(e) {}
+            isDwelling = false;
+            nextIndex++;
+          });
+        }, Math.max(80, finalDwell));
+
+      } catch (err) {
+        console.error("scrub tick error", err);
+      } finally {
+        scrubLock = false;
+      }
     }, Math.max(40, 1000 / Math.max(0.1, parseFloat(slider.value) || 1)));
   }
 
   function stopSmartScrub() {
-    clearInterval(timer);
+    if (timer) clearInterval(timer);
     timer = null;
-    clearTimeout(dwellTimeout);
+    if (dwellTimeout) clearTimeout(dwellTimeout);
     dwellTimeout = null;
     isDwelling = false;
+    scrubLock = false;
     display.textContent = "";
     audio.playbackRate = Math.max(0.5, Math.min(4, parseFloat(slider.value) || 1));
   }
@@ -371,10 +385,12 @@
   // small safety: stop scrub if user manually plays audio
   audio.addEventListener('play', () => {
     if (fastSpeed > 2) {
-      // If user explicitly hit play while scrubbing, stop smart scrub and hand control back to user
       stopSmartScrub();
     }
   });
+
+  // stop scrub when audio ends
+  audio.addEventListener('ended', () => stopSmartScrub());
 
   </script>
 </body>
