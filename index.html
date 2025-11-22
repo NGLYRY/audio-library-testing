@@ -45,6 +45,7 @@
     const timeDisplay = document.getElementById('timeDisplay');
     const thresholdSlider = document.getElementById('thresholdSlider');
     const thresholdLabel = document.getElementById('thresholdLabel');
+    const PRE_ROLL_SEC = 0.05; // Pre-roll before word for context
     
 
     // Web Audio API setup for smooth transitions
@@ -427,7 +428,7 @@
 
     // Update threshold slider UI based on speed (if user hasn't manually adjusted)
     function updateThresholdUIFromSpeed() {
-      const dynamicP = Math.min(0.95, 0.50 + (fastSpeed - 2) * 0.15);
+      const dynamicP = Math.min(0.95, 0.60 + (fastSpeed - 2) * 0.18);
       thresholdSlider.value = Math.round(dynamicP * 100);
       thresholdLabel.textContent = `${Math.round(dynamicP * 100)}th percentile`;
     }
@@ -487,10 +488,10 @@
         if (typeof next.end === 'number' && next.end > next.start) {
           const durMs = (next.end - next.start) * 1000;
           // Keep full word duration for clarity, but ensure reasonable bounds
-          dwellMs = Math.max(200, Math.min(1200, durMs));
+          dwellMs = Math.max(200, Math.min(1400, durMs));
         } else {
           // Fallback to reasonable default
-          dwellMs = 400;
+          dwellMs = 200;
         }
 
         // Start dwell using decoded buffer (no HTMLAudio seek) to avoid clicks
@@ -504,7 +505,7 @@
         }
         
         // Update native control progress and UI time to the word's timestamp
-        try { audio.currentTime = next.start; } catch {}
+        try { audio.currentTime = Math.max(0, next.start - PRE_ROLL_SEC); } catch {}
         updateTimeDisplayUI(next.start, smartBuffer ? smartBuffer.duration : audio.duration);
 
         // Play the word segment with built-in envelope
