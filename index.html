@@ -49,12 +49,35 @@
     
 
     // Web Audio API setup for smooth transitions
-    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    /*const audioContext = new (window.AudioContext || window.webkitAudioContext)();
     const gainNode = audioContext.createGain();
     const source = audioContext.createMediaElementSource(audio);
     source.connect(gainNode);
     gainNode.connect(audioContext.destination);
-    gainNode.gain.value = 1;
+    gainNode.gain.value = 1;*/
+
+    let audioContext = null;
+    let gainNode = null;
+    let mediaSource = null;
+    
+    function initAudioGraph() {
+      if (audioContext) return; // Only run once
+    
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      gainNode = audioContext.createGain();
+      mediaSource = audioContext.createMediaElementSource(audio);
+    
+      mediaSource.connect(gainNode);
+      gainNode.connect(audioContext.destination);
+      gainNode.gain.value = 1;
+    }
+    
+    // Safari only allows AudioContext after user gesture
+    document.addEventListener("click", () => {
+      initAudioGraph();
+      audioContext.resume();
+    }, { once: true });
+
 
     // Smart-scrub playback via decoded buffer to avoid seek clicks
     let smartBuffer = null;                 // Decoded AudioBuffer of current track
