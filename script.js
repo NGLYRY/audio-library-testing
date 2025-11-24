@@ -1,3 +1,7 @@
+// Patched audio player script — Safari/macOS compatibility fixes applied
+// 1) createMediaElementSource guarded so it's created only once
+// 2) resume AudioContext before decodeAudioData
+
 const musicContainer = document.getElementById('music-container')
 const playBtn = document.getElementById('play')
 const replaySecondBtn = document.getElementById('replaySecond')
@@ -19,7 +23,7 @@ const currentStep = document.getElementById('currentStep');
 const backwardSpeed = document.getElementById('backwardSpeed');
 
 let audioContext;
-let audioSource;
+let audioSource; // guarded: createMediaElementSource only once
 let gainNode;
 let isWebAudioConnected = false;
 
@@ -34,7 +38,6 @@ const uploadUrl = "https://api.assemblyai.com/v2/upload";
 const transcribeUrl = "https://api.assemblyai.com/v2/transcript";
 
 const songs = ['selectedpoems_01_furlong_64kb', 'selectedpoems_02_furlong_64kb', 'selectedpoems_03_furlong_64kb', 'round.mp3', 'manwhothinks'];
-
 
 let songIndex = 4;
 
@@ -202,10 +205,22 @@ function initWebAudio() {
         
         // Connect audio element to Web Audio API
         if (!isWebAudioConnected && audio) {
-            audioSource = audioContext.createMediaElementSource(audio);
-            audioSource.connect(gainNode);
-            gainNode.connect(audioContext.destination);
-            isWebAudioConnected = true;
+            // Create MediaElementSource only once — Safari throws if called multiple times
+            if (!audioSource) {
+                audioSource = audioContext.createMediaElementSource(audio);
+                audioSource.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+                isWebAudioConnected = true;
+            } else {
+                // If audioSource already exists, ensure it's connected
+                try {
+                    audioSource.connect(gainNode);
+                    gainNode.connect(audioContext.destination);
+                    isWebAudioConnected = true;
+                } catch (e) {
+                    console.warn('Could not reconnect existing audioSource:', e);
+                }
+            }
         }
         
         console.log('Web Audio API initialized successfully');
@@ -222,8 +237,26 @@ async function loadAudioBuffer() {
     
     try {
         console.log('Loading audio buffer for backward playback...');
+        // Ensure audioContext is present
+        if (!audioContext) {
+            console.warn('No audioContext available — creating one');
+            initWebAudio();
+        }
+
+        // Resume AudioContext if suspended (Safari requires this before decode)
+        if (audioContext && audioContext.state === 'suspended') {
+            try {
+                await audioContext.resume();
+                console.log('AudioContext resumed before decode');
+            } catch (e) {
+                console.warn('resume() failed before decode:', e);
+            }
+        }
+
         const response = await fetch(audio.src);
         const arrayBuffer = await response.arrayBuffer();
+
+        // decodeAudioData may throw or return null in older WebKit if not resumed — guard with try/catch
         audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
         console.log('Audio buffer loaded successfully');
         return audioBuffer;
@@ -254,25 +287,29 @@ function playSegment(startTime, duration, playbackRate = 1.0) {
         const now = audioContext.currentTime;
         const fade = Math.min(0.03, duration / 6); // 30ms or smaller fraction
 
+        // Clamp start/duration tightly to avoid Safari rejecting start() calls
+        const safeStart = Math.max(0, Math.min(startTime, Math.max(0, audioBuffer.duration - 0.001)));
+        const safeDur   = Math.max(0.001, Math.min(duration, Math.max(0.001, audioBuffer.duration - safeStart)));
+
         // Audio rounding:Start with gain 0, ramp up quickly to avoid clicks, then ramp down before end
         segmentGain.gain.setValueAtTime(0, now);
         segmentGain.gain.linearRampToValueAtTime(1.0, now + fade);
-        segmentGain.gain.setValueAtTime(1.0, now + duration - fade);
-        segmentGain.gain.linearRampToValueAtTime(0, now + duration);
+        segmentGain.gain.setValueAtTime(1.0, now + safeDur - fade);
+        segmentGain.gain.linearRampToValueAtTime(0, now + safeDur);
 
-        // Start the source scheduled to play immediately (sample offset = startTime)
-        source.start(now, startTime, duration);
+        // Start the source scheduled to play immediately (sample offset = safeStart)
+        source.start(now, safeStart, safeDur);
         
         const segmentData = {
             source: source,
             gainNode: segmentGain,
-            startTime: startTime,
-            duration: duration
+            startTime: safeStart,
+            duration: safeDur
         };
         
         // Segment cleanup 
         source.onended = () => {
-            console.log('Segment ended:', startTime.toFixed(2), 'to', (startTime + duration).toFixed(2));
+            console.log('Segment ended:', safeStart.toFixed(2), 'to', (safeStart + safeDur).toFixed(2));
             try {
                 source.disconnect();
                 segmentGain.disconnect();
@@ -291,7 +328,7 @@ function stopAllSources(sources) {
     sources.forEach(item => {
         try {
             if (item.source) {
-                item.source.stop();
+                try { item.source.stop(); } catch (e) {}
                 item.source.disconnect();
             }
             if (item.gainNode) {
@@ -613,9 +650,7 @@ async function resumeAudioContext() {
     }
 }
 
-// Initially load song details into DOM
-loadSong(songs[songIndex]);
-
+// NOTE: loadSong() is NOT called on page load anymore — it is deferred until first interaction
 function loadSong(song) {
     // Stop backward mode if active
     if (backwardMode) {
@@ -625,14 +660,15 @@ function loadSong(song) {
     // Clear audio buffer when loading new song
     audioBuffer = null;
     
+    // Set the src (relative path expected)
     audio.src = `mp3s/${song}.mp3`;
     
-    // Preload audio buffer for backward playback
+    // After a short delay (and after user gesture) preload audio buffer for backward playback
     setTimeout(() => {
         if (audioContext) {
             loadAudioBuffer().catch(console.error);
         }
-    }, 1000);
+    }, 500);
 }
 
 async function playSong() {
@@ -649,8 +685,14 @@ async function playSong() {
         }
     }
     
-    // Resume audio context if suspended
-    await resumeAudioContext();
+    // Resume audio context if suspended; Safari requires this before any WebAudio operations
+    if (audioContext && audioContext.state !== 'running') {
+        try {
+            await audioContext.resume();
+        } catch (e) {
+            console.warn('resume() failed in playSong:', e);
+        }
+    }
     
     manualPause = false;
     
@@ -801,8 +843,8 @@ function DurTime (e) {
                 }
             }
         }else{
-         	sec = Math.floor(x);
-         	sec = sec <10 ? '0'+sec:sec;
+            	sec = Math.floor(x);
+            	sec = sec <10 ? '0'+sec:sec;
          }
     } 
 
@@ -827,9 +869,9 @@ function DurTime (e) {
                 }
             }
         }else{
-         	sec_d = (isNaN(duration) === true)? '0':
-         	Math.floor(x);
-         	sec_d = sec_d <10 ? '0'+sec_d:sec_d;
+            	sec_d = (isNaN(duration) === true)? '0':
+            	Math.floor(x);
+            	sec_d = sec_d <10 ? '0'+sec_d:sec_d;
          }
     } 
 
@@ -902,7 +944,7 @@ stepInput.addEventListener('input', updateParameterDisplays);
 updateParameterDisplays();
 
 // Event listeners for play button
-playBtn.addEventListener('click', () => {
+playBtn.addEventListener('click', async () => {
   const currentSpeedVal = parseFloat(speedSlider.value);
   const isPlaying = (!audio.paused && !backwardMode) || (backwardMode && !manualPause);
 
@@ -915,7 +957,7 @@ playBtn.addEventListener('click', () => {
   if (currentSpeedVal < 0) {
     // Negative speed: play in backward mode
     if (!backwardMode) {
-      enterBackwardMode();
+      await enterBackwardMode();
     } else {
       manualPause = false;
     }
@@ -959,6 +1001,9 @@ function handleFirstInteraction() {
     if (!audioContext) {
         initWebAudio();
     }
+    // Load chosen song only after user gesture — Safari blocks many audio ops without it
+    loadSong(songs[songIndex]);
+
     // remove event listeners after first interaction
     document.removeEventListener('click', handleFirstInteraction);
     document.removeEventListener('keydown', handleFirstInteraction);
