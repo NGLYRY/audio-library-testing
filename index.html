@@ -317,21 +317,6 @@
         console.warn('No words in transcript');
         return;
       }
-
-      console.group('📄 TRANSCRIPT');
-      console.log('%c━'.repeat(50), 'color: #ffd500');
-      
-      // Build full transcript text
-      const fullText = words.map(w => w.text).join(' ');
-      console.log('%c' + fullText, 'font-size: 14px; line-height: 1.6;');
-      
-      console.log('%c━'.repeat(50), 'color: #ffd500');
-      console.log(`📊 Statistics: ${words.length} words`);
-      console.groupEnd();
-
-      // Word-by-word breakdown
-      console.group('📝 Word-by-Word Transcript (with timestamps)');
-      console.log('%c━'.repeat(50), 'color: #ffd500');
       
       words.forEach((word, index) => {
         // word.start and word.end are already in seconds (converted in getTranscript)
@@ -517,8 +502,7 @@
           dwellMs = 200;
         }
 
-        // Start dwell using decoded buffer (no HTMLAudio seek) to avoid clicks
-        isDwelling = true;
+        // Prepare dwell using decoded buffer (no HTMLAudio seek) to avoid clicks
         display.textContent = next.text;
         audio.playbackRate = 1.0;
         
@@ -531,22 +515,19 @@
         try { audio.currentTime = Math.max(0, next.start - PRE_ROLL_SEC); } catch {}
         updateTimeDisplayUI(next.start, smartBuffer ? smartBuffer.duration : audio.duration);
 
+        // If buffer not ready yet, skip this cycle and ensure HTML audio stays paused
+        if (!smartBuffer) { try { audio.pause(); } catch {} ; return; }
+
         // Play the word segment with built-in envelope
         const ok = playSmartSegment(next.start, dwellMs);
         if (!ok) {
-          // Fallback: if buffer unavailable, at least avoid loud click by muting briefly
-          const fadeTime = 0.01;
-          gainNode.gain.cancelScheduledValues(audioContext.currentTime);
-          gainNode.gain.setValueAtTime(gainNode.gain.value, audioContext.currentTime);
-          gainNode.gain.linearRampToValueAtTime(0, audioContext.currentTime + fadeTime);
-          setTimeout(() => {
-            audio.currentTime = next.start;
-            gainNode.gain.setValueAtTime(0, audioContext.currentTime);
-            gainNode.gain.linearRampToValueAtTime(1, audioContext.currentTime + fadeTime);
-            audio.play().catch(()=>{});
-          }, fadeTime * 1000);
+          // Skip this cycle; keep HTML audio paused to avoid double playback
+          try { audio.pause(); } catch {}
+          return;
         }
 
+        // Mark dwell only after successful start
+        isDwelling = true;
         clearTimeout(dwellTimeout);
         dwellTimeout = setTimeout(() => {
           // End dwell: stop segment (with quick fade) and advance
