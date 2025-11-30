@@ -22,8 +22,11 @@
   <input type="range" id="speed" min="0.5" max="4" step="0.1" value="1">
   <span id="label">1.0x</span><br><br>
   <label>Semantic Threshold:</label>
-  <input type="range" id="thresholdSlider" min="50" max="90" step="1" value="75">
+  <input type="range" id="thresholdSlider" min="50" max="95" step="1" value="75">
   <span id="thresholdLabel">75th percentile</span><br><br>
+  <label>Word Interval:</label>
+  <input type="range" id="intervalSlider" min="150" max="1000" step="50" value="700">
+  <span id="intervalLabel">Auto (700ms)</span><br><br>
   
   <button id="pauseBtn" style="display:none; padding:10px 20px; font-size:16px; cursor:pointer;">Pause Smart Scrub</button>
   <div id="keywordDisplay"></div>
@@ -42,11 +45,11 @@
     const status = document.getElementById('status');
     const fileInput = document.getElementById('audioFile');
     const pauseBtn = document.getElementById('pauseBtn');
-    const timeDisplay = document.getElementById('timeDisplay');
     const thresholdSlider = document.getElementById('thresholdSlider');
     const thresholdLabel = document.getElementById('thresholdLabel');
+    const intervalSlider = document.getElementById('intervalSlider');
+    const intervalLabel = document.getElementById('intervalLabel');
     const PRE_ROLL_SEC = 0.05; // Pre-roll before word for context
-    
 
     // Web Audio API setup for smooth transitions
     /*const audioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -83,7 +86,6 @@
     let smartBuffer = null;                 // Decoded AudioBuffer of current track
     let smartSrc = null;                    // Current BufferSource for word playback
     let smartGain = null;                   // Gain node for word envelope
-    let smartCleanupTimer = null;           // Cleanup timer after fade-out
 
     async function decodeAudioFromBlob(blob) {
       try {
@@ -115,8 +117,7 @@
         // Ramp to 0 then stop shortly after
         smartGain.gain.setValueAtTime(smartGain.gain.value, now);
         smartGain.gain.linearRampToValueAtTime(0, now + fade);
-        clearTimeout(smartCleanupTimer);
-        smartCleanupTimer = setTimeout(() => {
+        setTimeout(() => {
           try { smartSrc.stop(); } catch {}
           try { smartSrc.disconnect(); } catch {}
           try { smartGain.disconnect(); } catch {}
@@ -128,8 +129,8 @@
 
     function playSmartSegment(startSec, durationMs) {
       if (!smartBuffer) return false;
-      // Ensure any previous segment is stopped cleanly
-      stopSmartSegment(8);
+      // Stop previous segment with minimal fade to reduce cut-off
+      stopSmartSegment(5);
       const durationSec = Math.max(0.03, (durationMs || 200) / 1000);
       const offset = Math.max(0, Math.min(startSec || 0, smartBuffer.duration - 0.01));
       if (offset >= smartBuffer.duration) return false;
@@ -149,7 +150,10 @@
       segGain.gain.linearRampToValueAtTime(0, now + durationSec);
 
       try {
-        src.start(now, offset, Math.min(durationSec, Math.max(0.01, smartBuffer.duration - offset)));
+        const playDuration = Math.min(durationSec, Math.max(0.01, smartBuffer.duration - offset));
+        src.start(now, offset, playDuration);
+        // Debug log for troubleshooting
+        // console.log(`Playing word at ${startSec.toFixed(2)}s for ${(playDuration*1000).toFixed(0)}ms`);
       } catch (e) {
         console.error('Failed to start smart segment', e);
         try { src.disconnect(); segGain.disconnect(); } catch {}
@@ -171,29 +175,24 @@
   let informativeWords = [];
     let allTranscriptWords = [];  // Cache of full transcript for recalculating with different speeds
     let timer = null;
-    let isDwelling = false;
-    let dwellTimeout = null;
     let fastSpeed = 1;
     let nextIndex = 0;
     let isSmartScrubPaused = false;
     let manualThresholdPercentile = null; // User override for threshold
     let hasUserAdjustedThreshold = false; // Track if user manually set threshold
+    let userIntervalMs = null; // User override for word interval
+    let speedTimeout; // Debounce timeout for speed slider
     // Basic common words
-    const commonWords = new Set(["the","and","is","in","on","it","of","to","a","an","i","you","that","this"]);
-
-    // Time formatting helpers
-    function formatTime(sec) {
-      if (!isFinite(sec) || sec < 0) sec = 0;
-      const m = Math.floor(sec / 60);
-      const s = Math.floor(sec % 60);
-      return `${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
-    }
-    function updateTimeDisplayUI(currentSec, totalSec) {
-      if (!timeDisplay) return;
-      const cur = formatTime(currentSec || 0);
-      const tot = formatTime(totalSec || audio.duration || 0);
-      timeDisplay.textContent = `${cur} / ${tot}`;
-    }
+    const commonWords = new Set(
+      ["the","and","is","in","on","it","of","to","a","an","i","you","that","this",
+      "he","she","they","we","for","with","as","at","by","from","but","or","not",
+      "be","was","were","are","have","has","had","do","does","did","so","if","no",
+      "yes","all","any","there","here","when","where","what","which","who","whom","why","how",
+      "my","your","his","her","its","our","their","me","him","them","us","one","about",
+      "like","just","more","some","out","up","down","now","then","also","than","too","very",
+      "can","will","would","should","could","may","might","must", "go", "get", "got"
+      ]
+    );
 
     // Pause button functionality
     pauseBtn.onclick = () => {
@@ -208,8 +207,6 @@
         audio.pause();
         // Stop any currently playing smart segment to avoid tails/clicks
         stopSmartSegment(8);
-        clearTimeout(dwellTimeout);
-        isDwelling = false;
         // Reset gain smoothly
         gainNode.gain.cancelScheduledValues(audioContext.currentTime);
         gainNode.gain.setValueAtTime(gainNode.gain.value, audioContext.currentTime);
@@ -222,8 +219,6 @@
       try {
         // Decode for smart-scrub playback
         smartBuffer = await decodeAudioFromBlob(blob);
-        // Initialize time display with total duration
-        if (smartBuffer) updateTimeDisplayUI(0, smartBuffer.duration);
         
         status.textContent = "Uploading audio...";
         const audioUrl = await uploadToAssembly(blob);
@@ -396,10 +391,10 @@
       scores.sort((a, b) => a - b);
       
       // Dynamic percentile based on playback speed (unless overridden)
-      // At 2.1x: ~75th percentile (top 25% words)
+      // At 2.1x: 75th percentile (top 25% words)
       // At 3x: ~85th percentile (top 15% words)
       // At 4x: ~92th percentile (top 8% words)
-      let p = Math.min(0.95, 0.50 + (speed - 2) * 0.15);
+      let p = Math.min(0.95, 0.75 + (speed - 2.1) * 0.085);
       if (overridePercentile !== null && overridePercentile >= 0.50 && overridePercentile <= 0.95) {
         p = overridePercentile; // Use user's manual override
       }
@@ -436,24 +431,86 @@
 
     // Update threshold slider UI based on speed (if user hasn't manually adjusted)
     function updateThresholdUIFromSpeed() {
-      const dynamicP = Math.min(0.95, 0.60 + (fastSpeed - 2) * 0.18);
+      const dynamicP = Math.min(0.95, 0.75 + (fastSpeed - 2.1) * 0.085);
       thresholdSlider.value = Math.round(dynamicP * 100);
       thresholdLabel.textContent = `${Math.round(dynamicP * 100)}th percentile`;
     }
 
-    slider.oninput = () => {
+    // Speed slider with debouncing to prevent stuttering during adjustment
+    slider.addEventListener('input', () => {
       const sp = parseFloat(slider.value);
+      
+      // Update UI immediately for smooth feedback
       label.textContent = sp.toFixed(1) + "x";
       fastSpeed = sp;
-      updateThresholdUIFromSpeed(); // Update threshold slider to match speed
+      
+      // Update threshold slider to match speed
+      updateThresholdUIFromSpeed();
+      
+      // Update interval label if user hasn't manually set it
+      if (userIntervalMs === null && sp > 2) {
+        const autoInterval = Math.max(150, 700 / Math.max(0.1, sp - 1.5));
+        intervalSlider.value = Math.round(autoInterval);
+        intervalLabel.textContent = `Auto (${Math.round(autoInterval)}ms)`;
+      }
+      
+      // Clear previous timeout
+      clearTimeout(speedTimeout);
+      
+      // If already in smart scrub mode, just update parameters (don't restart)
+      if (timer !== null && sp > 2) {
+        // Smart scrub is active, parameters will be picked up by existing timer
+        // Only recalc words after user stops dragging
+        speedTimeout = setTimeout(() => {
+          recalcInformative(false); // Don't reset index during adjustment
+        }, 150);
+        return;
+      }
+      
+      // Set timeout for mode changes (entering/exiting smart scrub)
+      speedTimeout = setTimeout(() => {
+        if (sp > 2) {
+          recalcInformative(true);
+          if (!timer) startSmartScrub();
+        } else {
+          const shouldResume = timer !== null;
+          stopSmartScrub();
+          audio.playbackRate = sp;
+          if (shouldResume) {
+            audio.play().catch(() => {});
+          }
+        }
+      }, 100);
+    });
+    
+    // Handle when user releases the slider for immediate response on mode changes
+    slider.addEventListener('change', () => {
+      clearTimeout(speedTimeout);
+      const sp = parseFloat(slider.value);
+      
+      fastSpeed = sp;
+      label.textContent = sp.toFixed(1) + "x";
+      updateThresholdUIFromSpeed();
+      
+      if (userIntervalMs === null && sp > 2) {
+        const autoInterval = Math.max(150, 700 / Math.max(0.1, sp - 1.5));
+        intervalSlider.value = Math.round(autoInterval);
+        intervalLabel.textContent = `Auto (${Math.round(autoInterval)}ms)`;
+      }
+      
       if (sp > 2) {
-        recalcInformative(true);
+        // If not in smart scrub, recalc and start; if already in, just recalc
+        recalcInformative(timer === null);
         if (!timer) startSmartScrub();
       } else {
+        const shouldResume = timer !== null;
         stopSmartScrub();
         audio.playbackRate = sp;
+        if (shouldResume) {
+          audio.play().catch(() => {});
+        }
       }
-    };
+    });
 
     // Semantic threshold slider handler
     thresholdSlider.oninput = () => {
@@ -464,9 +521,15 @@
       recalcInformative(false); // Recalc without resetting index
     };
 
+    // Word interval slider handler
+    intervalSlider.oninput = () => {
+      const val = parseInt(intervalSlider.value, 10); // 150-1000
+      userIntervalMs = val;
+      intervalLabel.textContent = `${val}ms`;
+    };
+
     function startSmartScrub() {
-      // In smart-scrub mode, we do NOT speed up audio between words.
-      // We keep audio paused except when dwelling on an informative word at 1.0x.
+      // Smart-scrub mode: play words at fixed time intervals (faster speed = shorter intervals)
       audio.pause();
       audio.playbackRate = 1.0;
       // Ensure audio context is running for buffer playback
@@ -477,73 +540,72 @@
       isSmartScrubPaused = false;
       pauseBtn.textContent = "Pause Smart Scrub";
 
-      // Use a shorter fixed interval and check speed dynamically inside
+      // Calculate interval between words based on speed or user override
+      // Base interval: 700ms at 2.1x, decreasing as speed increases
+      // Formula: 700ms / (speed - 1.5) gives ~700ms at 2.1x, ~467ms at 3x, ~280ms at 4x
+      const getIntervalMs = () => {
+        if (userIntervalMs !== null) return userIntervalMs;
+        return Math.max(150, 700 / Math.max(0.1, fastSpeed - 1.5));
+      };
+      
+      let lastPlayTime = Date.now();
+
       timer = setInterval(() => {
-        // Keep running even if audio is paused; scrubbing is driven by timer + seeks
         if (fastSpeed <= 2) return stopSmartScrub();
-        if (isDwelling || isSmartScrubPaused) return; // wait until current dwell finishes or paused
+        if (isSmartScrubPaused) return;
 
-        // Advance pointer to next informative word ahead of current time
-        while (nextIndex < informativeWords.length && informativeWords[nextIndex].start <= audio.currentTime) {
-          nextIndex++;
-        }
+        // Check if enough time has passed to play next word
+        const now = Date.now();
+        const intervalMs = getIntervalMs();
+        if (now - lastPlayTime < intervalMs) return;
+
+        // Find next word
         if (nextIndex >= informativeWords.length) return stopSmartScrub();
-
         const next = informativeWords[nextIndex];
 
-        // Determine dwell length: keep words understandable with minimum duration
-        let dwellMs;
+        // Use actual word duration from transcript if available
+        let wordDurationMs;
         if (typeof next.end === 'number' && next.end > next.start) {
-          const durMs = (next.end - next.start) * 1000;
-          // Keep full word duration for clarity, but ensure reasonable bounds
-          dwellMs = Math.max(200, Math.min(1400, durMs));
+          wordDurationMs = (next.end - next.start) * 1000; // Actual word duration
         } else {
-          // Fallback to reasonable default
-          dwellMs = 200;
+          wordDurationMs = 250; // Fallback if no end timestamp
+          console.warn(`Word "${next.text}" missing end timestamp, using ${wordDurationMs}ms`);
         }
-
-        // Prepare dwell using decoded buffer (no HTMLAudio seek) to avoid clicks
-        display.textContent = next.text;
-        audio.playbackRate = 1.0;
         
-        // Ensure we have a decoded buffer; if not, try to decode current src lazily
+        // Ensure minimum gap: if word is too long relative to interval, cap it
+        const minGapMs = 50; // Minimum 50ms silence between words
+        const maxWordDuration = intervalMs - minGapMs;
+        if (wordDurationMs > maxWordDuration) {
+          wordDurationMs = Math.max(150, maxWordDuration); // Cap but keep at least 150ms
+        }
+        
+        display.textContent = next.text;
+        
+        // Ensure we have a decoded buffer
         if (!smartBuffer && audio.src) {
           decodeAudioFromUrl(audio.src).then(buf => { smartBuffer = buf; });
+          return; // Skip this cycle, try again next tick
         }
         
-        // Update native control progress and UI time to the word's timestamp
+        // Update position
         try { audio.currentTime = Math.max(0, next.start - PRE_ROLL_SEC); } catch {}
-        updateTimeDisplayUI(next.start, smartBuffer ? smartBuffer.duration : audio.duration);
 
-        // If buffer not ready yet, skip this cycle and ensure HTML audio stays paused
-        if (!smartBuffer) { try { audio.pause(); } catch {} ; return; }
-
-        // Play the word segment with built-in envelope
-        const ok = playSmartSegment(next.start, dwellMs);
-        if (!ok) {
-          // Skip this cycle; keep HTML audio paused to avoid double playback
-          try { audio.pause(); } catch {}
-          return;
+        // Play the word - stopSmartSegment is called inside playSmartSegment
+        const played = playSmartSegment(next.start, wordDurationMs);
+        if (!played) {
+          console.warn(`Failed to play word "${next.text}" at ${next.start.toFixed(2)}s`);
         }
 
-        // Mark dwell only after successful start
-        isDwelling = true;
-        clearTimeout(dwellTimeout);
-        dwellTimeout = setTimeout(() => {
-          // End dwell: stop segment (with quick fade) and advance
-          stopSmartSegment(8);
-          isDwelling = false;
-          nextIndex++;
-        }, dwellMs);
-      }, 50); // Fixed 50ms interval for responsive speed changes
+        // Advance to next word and update last play time
+        nextIndex++;
+        lastPlayTime = now;
+        
+      }, 50); // Check every 50ms
     }
 
     function stopSmartScrub() {
       clearInterval(timer);
       timer = null;
-      clearTimeout(dwellTimeout);
-      isDwelling = false;
-      dwellTimeout = null;
       display.textContent = "";
       pauseBtn.style.display = 'none';
       isSmartScrubPaused = false;
@@ -553,7 +615,7 @@
       gainNode.gain.cancelScheduledValues(audioContext.currentTime);
       gainNode.gain.setValueAtTime(gainNode.gain.value, audioContext.currentTime);
       gainNode.gain.linearRampToValueAtTime(1, audioContext.currentTime + 0.01);
-      // Do not force playback state here beyond rate; leave play/pause to the user
+      // Restore playback rate (don't auto-play here, let caller decide)
       audio.playbackRate = Math.max(0.5, Math.min(4, parseFloat(slider.value) || 1));
     }
   </script>
