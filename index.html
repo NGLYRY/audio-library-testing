@@ -22,11 +22,11 @@
   <input type="range" id="speed" min="0.5" max="4" step="0.1" value="1">
   <span id="label">1.0x</span><br><br>
   <label>Semantic Threshold:</label>
-  <input type="range" id="thresholdSlider" min="50" max="95" step="1" value="75">
-  <span id="thresholdLabel">75th percentile</span><br><br>
+  <input type="range" id="thresholdSlider" min="75" max="95" step="1" value="80">
+  <span id="thresholdLabel">80th percentile</span><br><br>
   <label>Word Interval:</label>
-  <input type="range" id="intervalSlider" min="150" max="1000" step="50" value="700">
-  <span id="intervalLabel">Auto (700ms)</span><br><br>
+  <input type="range" id="intervalSlider" min="150" max="1000" step="50" value="500">
+  <span id="intervalLabel">500ms</span><br><br>
   
   <button id="pauseBtn" style="display:none; padding:10px 20px; font-size:16px; cursor:pointer;">Pause Smart Scrub</button>
   <div id="keywordDisplay"></div>
@@ -180,7 +180,7 @@
     let isSmartScrubPaused = false;
     let manualThresholdPercentile = null; // User override for threshold
     let hasUserAdjustedThreshold = false; // Track if user manually set threshold
-    let userIntervalMs = null; // User override for word interval
+    let userIntervalMs = 500; // User override for word interval
     let speedTimeout; // Debounce timeout for speed slider
     // Basic common words
     const commonWords = new Set(
@@ -394,8 +394,8 @@
       // At 2.1x: 75th percentile (top 25% words)
       // At 3x: ~85th percentile (top 15% words)
       // At 4x: ~92th percentile (top 8% words)
-      let p = Math.min(0.95, 0.75 + (speed - 2.1) * 0.085);
-      if (overridePercentile !== null && overridePercentile >= 0.50 && overridePercentile <= 0.95) {
+      let p = Math.min(0.95, 0.80 + (speed - 2.1) * 0.08);
+      if (overridePercentile !== null && overridePercentile >= 0.60 && overridePercentile <= 0.95) {
         p = overridePercentile; // Use user's manual override
       }
       const idx75 = Math.floor(p * (scores.length - 1));
@@ -431,7 +431,7 @@
 
     // Update threshold slider UI based on speed (if user hasn't manually adjusted)
     function updateThresholdUIFromSpeed() {
-      const dynamicP = Math.min(0.95, 0.75 + (fastSpeed - 2.1) * 0.085);
+      const dynamicP = Math.min(0.95, 0.80 + (fastSpeed - 2.1) * 0.08);
       thresholdSlider.value = Math.round(dynamicP * 100);
       thresholdLabel.textContent = `${Math.round(dynamicP * 100)}th percentile`;
     }
@@ -446,13 +446,6 @@
       
       // Update threshold slider to match speed
       updateThresholdUIFromSpeed();
-      
-      // Update interval label if user hasn't manually set it
-      if (userIntervalMs === null && sp > 2) {
-        const autoInterval = Math.max(150, 700 / Math.max(0.1, sp - 1.5));
-        intervalSlider.value = Math.round(autoInterval);
-        intervalLabel.textContent = `Auto (${Math.round(autoInterval)}ms)`;
-      }
       
       // Clear previous timeout
       clearTimeout(speedTimeout);
@@ -491,12 +484,6 @@
       fastSpeed = sp;
       label.textContent = sp.toFixed(1) + "x";
       updateThresholdUIFromSpeed();
-      
-      if (userIntervalMs === null && sp > 2) {
-        const autoInterval = Math.max(150, 700 / Math.max(0.1, sp - 1.5));
-        intervalSlider.value = Math.round(autoInterval);
-        intervalLabel.textContent = `Auto (${Math.round(autoInterval)}ms)`;
-      }
       
       if (sp > 2) {
         // If not in smart scrub, recalc and start; if already in, just recalc
