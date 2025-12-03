@@ -6,30 +6,30 @@ Step 1: This project can be deployed instantly using GitHub Pages. Enable GitHub
 
 Features
 
-Upload and play audio files in-browser.
+-Upload and play audio files in-browser.
 
-Change playback speed using a slider.
+-Change playback speed using a slider.
 
-Seek through audio using a draggable scrubber.
+-Seek through audio using a draggable scrubber, with transcription for high-scrubbing speed
 
-No terminal or local server is required.
+-No terminal or local server is required.
+
 
 How to Navigate the Live Demo
 
-Open the live demo site.
+1. Open the live demo site.
 
-Upload an audio file from your device.
+2. Upload an audio file from your device, or click play on the default audio built into the site
 
-Press Play to start listening.
+3. Press Play to start listening.
 
-Move the speed slider to adjust playback rate.
+4. Move the speed slider to adjust playback rate, press the Smart Scrub button for speeds greater than 2.0x to see real-time transcription of audio while it is playing forward.
 
-Drag the scrubber to jump forward or backward in the audio.
+5. Press Pause or Stop as needed to control playback.
 
-Press Pause or Stop as needed to control playback.
 
 Tips
 
-Use common audio formats like MP3 or WAV for best results.
+-Use common audio formats like MP3 audiobooks for best results.
 
-If audio does not autoplay, click once anywhere on the page and press Play again.
+-When using the default audio, do not click start until the message says "Done! You can now play and scrub through keywords."
