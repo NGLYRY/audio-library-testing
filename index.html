@@ -329,7 +329,7 @@
       console.groupEnd();
     }
 
-    // --- TF-IDF scoring over time windows ---
+    // --- Length & Rarity-based word scoring ---
     function selectInformativeWordsTFIDF(words, speed = 1, overridePercentile = null) {
       if (!Array.isArray(words) || words.length === 0) return [];
 
@@ -343,67 +343,42 @@
 
       if (tokens.length === 0) return [];
 
-      // Build time windows as pseudo-documents
-      const totalDuration = Math.max(...tokens.map(t => t.start));
-      const windowSizeSec = 10; // adjustable window size
-      const numWindows = Math.max(1, Math.ceil((totalDuration + 0.0001) / windowSizeSec));
-
-      /**
-       * df: number of windows that contain the term at least once
-       * tf: total count in entire transcript
-       */
-      const df = new Map();
-      const tf = new Map();
-
-      // Track which terms appear per window
-      const windowSets = Array.from({ length: numWindows }, () => new Set());
+      // Count frequency of each word in transcript
+      const wordFreq = new Map();
       for (const t of tokens) {
-        // Term Frequency
-        tf.set(t.text, (tf.get(t.text) || 0) + 1);
-
-        // Document Frequency across windows
-        const idx = Math.min(numWindows - 1, Math.max(0, Math.floor(t.start / windowSizeSec)));
-        windowSets[idx].add(t.text);
-      }
-      for (const s of windowSets) {
-        for (const term of s) {
-          df.set(term, (df.get(term) || 0) + 1);
-        }
+        wordFreq.set(t.text, (wordFreq.get(t.text) || 0) + 1);
       }
 
-      // Compute IDF with smoothing
-      const N = numWindows;
-      const idf = new Map();
-      for (const [term, dfCount] of df.entries()) {
-        idf.set(term, Math.log((N + 1) / (dfCount + 1)) + 1); // > 0
-      }
-
-      // Compute TF-IDF per term
-      const tfidf = new Map();
-      for (const [term, tfCount] of tf.entries()) {
-        const score = tfCount * (idf.get(term) || 0);
-        tfidf.set(term, score);
+      // Calculate score for each unique word based on length and rarity
+      // Score = word_length^2 / frequency
+      // Longer words get exponentially higher weight, rarer words get higher weight
+      const wordScores = new Map();
+      for (const [word, freq] of wordFreq.entries()) {
+        const length = word.length;
+        const rarity = 1 / freq; // Inverse frequency (rarer = higher)
+        const score = (length * length) * rarity; // Length squared times rarity factor
+        wordScores.set(word, score);
       }
 
       // Build distribution of scores to set a dynamic threshold based on speed
-      const scores = Array.from(tfidf.values()).filter(v => isFinite(v) && v > 0);
+      const scores = Array.from(wordScores.values()).filter(v => isFinite(v) && v > 0);
       if (scores.length === 0) return tokens; // fallback: return all tokens (already stopword-filtered)
       scores.sort((a, b) => a - b);
       
       // Dynamic percentile based on playback speed (unless overridden)
-      // At 2.1x: 75th percentile (top 25% words)
+      // At 2.1x: 80th percentile (top 20% words - longer/rarer ones)
       // At 3x: ~85th percentile (top 15% words)
       // At 4x: ~92th percentile (top 8% words)
       let p = Math.min(0.95, 0.80 + (speed - 2.1) * 0.08);
       if (overridePercentile !== null && overridePercentile >= 0.60 && overridePercentile <= 0.95) {
         p = overridePercentile; // Use user's manual override
       }
-      const idx75 = Math.floor(p * (scores.length - 1));
-      const threshold = scores[idx75];
+      const idx = Math.floor(p * (scores.length - 1));
+      const threshold = scores[idx];
 
-      // Attach per-token score based on its term score; filter by threshold
+      // Attach per-token score based on its word score; filter by threshold
       const informative = tokens
-        .map(t => ({ ...t, score: tfidf.get(t.text) || 0 }))
+        .map(t => ({ ...t, score: wordScores.get(t.text) || 0 }))
         .filter(t => t.score >= threshold)
         .sort((a, b) => a.start - b.start);
 
@@ -411,7 +386,7 @@
       return informative.map(({ text, start, end }) => ({ text, start, end }));
     }
 
-   // TF-IDF --- END ---
+   // Length & Rarity scoring --- END ---
 
     // Helper to recalculate informative words with current settings
     function recalcInformative(resetIndexToCurrent = true) {
