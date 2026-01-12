@@ -182,6 +182,7 @@
     let hasUserAdjustedThreshold = false; // Track if user manually set threshold
     let userIntervalMs = 500; // User override for word interval
     let speedTimeout; // Debounce timeout for speed slider
+    let internalSeekGuard = false; // Guard to ignore programmatic seeks
     // Basic common words
     const commonWords = new Set(
       ["the","and","is","in","on","it","of","to","a","an","i","you","that","this",
@@ -190,7 +191,7 @@
       "yes","all","any","there","here","when","where","what","which","who","whom","why","how",
       "my","your","his","her","its","our","their","me","him","them","us","one","about",
       "like","just","more","some","out","up","down","now","then","also","than","too","very",
-      "can","will","would","should","could","may","might","must", "go", "get", "got"
+      "can","will","would","should","could","may","might","must", "go", "get", "got", "information"
       ]
     );
 
@@ -232,7 +233,6 @@
         // Cache full transcript for recalculating with different speeds
         allTranscriptWords = words;
         
-        // Build informative words using TF-IDF over time windows
         informativeWords = selectInformativeWordsTFIDF(words, fastSpeed);
         nextIndex = 0;
         status.textContent = "Done! You can now play and scrub through keywords.";
@@ -441,12 +441,9 @@
           recalcInformative(true);
           if (!timer) startSmartScrub();
         } else {
-          const shouldResume = timer !== null;
           stopSmartScrub();
           audio.playbackRate = sp;
-          if (shouldResume) {
-            audio.play().catch(() => {});
-          }
+          audio.play().catch(() => {});
         }
       }, 100);
     });
@@ -465,12 +462,9 @@
         recalcInformative(timer === null);
         if (!timer) startSmartScrub();
       } else {
-        const shouldResume = timer !== null;
         stopSmartScrub();
         audio.playbackRate = sp;
-        if (shouldResume) {
-          audio.play().catch(() => {});
-        }
+        audio.play().catch(() => {});
       }
     });
 
@@ -489,6 +483,17 @@
       userIntervalMs = val;
       intervalLabel.textContent = `${val}ms`;
     };
+
+    // Realign smart scrub index when user seeks via the progress bar
+    audio.addEventListener('seeked', () => {
+      // Ignore programmatic seeks from the scrubber itself
+      if (internalSeekGuard) { internalSeekGuard = false; return; }
+      // Only adjust when smart scrub is active
+      if (timer !== null) {
+        stopSmartSegment(8);
+        recalcInformative(true);
+      }
+    });
 
     function startSmartScrub() {
       // Smart-scrub mode: play words at fixed time intervals (faster speed = shorter intervals)
@@ -542,8 +547,13 @@
           return; // Skip this cycle, try again next tick
         }
         
-        // Update position
-        try { audio.currentTime = Math.max(0, next.start - PRE_ROLL_SEC); } catch {}
+        // Update position (programmatic seek) and guard against triggering seek listeners
+        try {
+          internalSeekGuard = true;
+          audio.currentTime = Math.max(0, next.start - PRE_ROLL_SEC);
+        } catch {
+          internalSeekGuard = false;
+        }
 
         // Play the word - stopSmartSegment is called inside playSmartSegment
         const played = playSmartSegment(next.start, wordDurationMs);
