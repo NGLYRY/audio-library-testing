@@ -518,27 +518,20 @@
 
         // Check if enough time has passed to play next word
         const now = Date.now();
-        const intervalMs = getIntervalMs();
-        if (now - lastPlayTime < intervalMs) return;
+        const gapMs = getIntervalMs(); // Gap between words (after word finishes)
+        if (now - lastPlayTime < gapMs) return;
 
         // Find next word
         if (nextIndex >= informativeWords.length) return stopSmartScrub();
         const next = informativeWords[nextIndex];
 
-        // Use actual word duration from transcript if available
+        // Use actual word duration from transcript (full duration)
         let wordDurationMs;
         if (typeof next.end === 'number' && next.end > next.start) {
-          wordDurationMs = (next.end - next.start) * 1000; // Actual word duration
+          wordDurationMs = (next.end - next.start) * 1000; // Play full word duration
         } else {
           wordDurationMs = 250; // Fallback if no end timestamp
           console.warn(`Word "${next.text}" missing end timestamp, using ${wordDurationMs}ms`);
-        }
-        
-        // Ensure minimum gap: if word is too long relative to interval, cap it
-        const minGapMs = 50; // Minimum 50ms silence between words
-        const maxWordDuration = intervalMs - minGapMs;
-        if (wordDurationMs > maxWordDuration) {
-          wordDurationMs = Math.max(150, maxWordDuration); // Cap but keep at least 150ms
         }
         
         display.textContent = next.text;
@@ -559,8 +552,9 @@
         }
 
         // Advance to next word and update last play time
+        // lastPlayTime now includes word duration + gap for next cycle
         nextIndex++;
-        lastPlayTime = now;
+        lastPlayTime = now + wordDurationMs; // Next word can play after: word duration + gap
         
       }, 50); // Check every 50ms
     }
