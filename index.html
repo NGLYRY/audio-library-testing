@@ -17,6 +17,7 @@
 
 
   <audio id="audio" controls src="mp3s/manwhothinks.mp3"></audio><br>
+  <audio id="wordPlayer" style="display: none;" src="mp3s/manwhothinks.mp3"></audio><br>
 
   <label>Playback Speed:</label>
   <input type="range" id="speed" min="0.5" max="4" step="0.1" value="1">
@@ -25,8 +26,11 @@
   <input type="range" id="thresholdSlider" min="75" max="95" step="1" value="80">
   <span id="thresholdLabel">80th percentile</span><br><br>
   <label>Word Interval:</label>
-  <input type="range" id="intervalSlider" min="150" max="1000" step="50" value="500">
+  <input type="range" id="intervalSlider" min="0" max="1000" step="50" value="500">
   <span id="intervalLabel">500ms</span><br><br>
+  <label>Word Playback Speed:</label>
+  <input type="range" id="wordSpeedSlider" min="0.5" max="2" step="0.1" value="1">
+  <span id="wordSpeedLabel">1.0x</span><br><br>
   
   <button id="pauseBtn" style="display:none; padding:10px 20px; font-size:16px; cursor:pointer;">Pause Smart Scrub</button>
   <div id="keywordDisplay"></div>
@@ -39,6 +43,7 @@
     const transcribeUrl = "https://api.assemblyai.com/v2/transcript";
 
     const audio = document.getElementById('audio');
+    const wordPlayer = document.getElementById('wordPlayer');
     const slider = document.getElementById('speed');
     const label = document.getElementById('label');
     const display = document.getElementById('keywordDisplay');
@@ -49,6 +54,8 @@
     const thresholdLabel = document.getElementById('thresholdLabel');
     const intervalSlider = document.getElementById('intervalSlider');
     const intervalLabel = document.getElementById('intervalLabel');
+    const wordSpeedSlider = document.getElementById('wordSpeedSlider');
+    const wordSpeedLabel = document.getElementById('wordSpeedLabel');
     const PRE_ROLL_SEC = 0.05; // Pre-roll before word for context
 
     // Web Audio API setup for smooth transitions
@@ -81,6 +88,9 @@
       audioContext.resume();
     }, { once: true });
 
+    // Set up hidden word player with full volume
+    wordPlayer.volume = 1.0;
+    wordPlayer.muted = false;
 
     // Smart-scrub playback via decoded buffer to avoid seek clicks
     let smartBuffer = null;                 // Decoded AudioBuffer of current track
@@ -127,49 +137,44 @@
       } catch {}
     }
 
-    function playSmartSegment(startSec, durationMs) {
-      if (!smartBuffer) return false;
-      // Stop previous segment with minimal fade to reduce cut-off
-      stopSmartSegment(5);
-      const durationSec = Math.max(0.03, (durationMs || 200) / 1000);
-      const offset = Math.max(0, Math.min(startSec || 0, smartBuffer.duration - 0.01));
-      if (offset >= smartBuffer.duration) return false;
-
-      const src = audioContext.createBufferSource();
-      const segGain = audioContext.createGain();
-      src.buffer = smartBuffer;
-      src.connect(segGain);
-      segGain.connect(audioContext.destination);
-
-      // Envelope: small attack/release to avoid clicks
-      const now = audioContext.currentTime;
-      const fade = Math.min(0.03, durationSec / 6);
-      segGain.gain.setValueAtTime(0, now);
-      segGain.gain.linearRampToValueAtTime(1, now + fade);
-      segGain.gain.setValueAtTime(1, now + Math.max(fade, durationSec - fade));
-      segGain.gain.linearRampToValueAtTime(0, now + durationSec);
-
+    function playWordWithAudioElement(startSec, durationMs) {
+      // Stop any previous word playback
+      if (wordPlayerTimeout) clearTimeout(wordPlayerTimeout);
+      wordPlayer.pause();
+      
       try {
-        const playDuration = Math.min(durationSec, Math.max(0.01, smartBuffer.duration - offset));
-        src.start(now, offset, playDuration);
-        // Debug log for troubleshooting
-        // console.log(`Playing word at ${startSec.toFixed(2)}s for ${(playDuration*1000).toFixed(0)}ms`);
+        // Set playback speed and enable pitch preservation
+        wordPlayer.playbackRate = wordPlaybackSpeed;
+        wordPlayer.preservesPitch = true;
+        
+        // Seek to word start
+        wordPlayer.currentTime = startSec;
+        
+        // Calculate actual duration at the adjusted speed
+        const actualDurationMs = durationMs / wordPlaybackSpeed;
+        
+        // Play the word
+        const playPromise = wordPlayer.play();
+        if (playPromise !== undefined) {
+          playPromise.catch(e => console.error('Failed to play word:', e));
+        }
+        
+        // Stop after duration
+        wordPlayerTimeout = setTimeout(() => {
+          wordPlayer.pause();
+          wordPlayerTimeout = null;
+        }, actualDurationMs);
+        
+        return true;
       } catch (e) {
-        console.error('Failed to start smart segment', e);
-        try { src.disconnect(); segGain.disconnect(); } catch {}
+        console.error('Error playing word with audio element:', e);
         return false;
       }
+    }
 
-      // Track for stop/fade
-      smartSrc = src;
-      smartGain = segGain;
-      // Auto cleanup
-      src.onended = () => {
-        try { src.disconnect(); segGain.disconnect(); } catch {}
-        if (smartSrc === src) smartSrc = null;
-        if (smartGain === segGain) smartGain = null;
-      };
-      return true;
+    function playSmartSegment(startSec, durationMs) {
+      // Use the hidden audio player with native pitch preservation
+      return playWordWithAudioElement(startSec, durationMs);
     }
 
   let informativeWords = [];
@@ -181,8 +186,10 @@
     let manualThresholdPercentile = null; // User override for threshold
     let hasUserAdjustedThreshold = false; // Track if user manually set threshold
     let userIntervalMs = 500; // User override for word interval
+    let wordPlaybackSpeed = 1.0; // Speed for individual word playback
     let speedTimeout; // Debounce timeout for speed slider
     let internalSeekGuard = false; // Guard to ignore programmatic seeks
+    let wordPlayerTimeout = null; // Track timeout for stopping word player
     // Basic common words
     const commonWords = new Set(
       ["the","and","is","in","on","it","of","to","a","an","i","you","that","this",
@@ -482,6 +489,13 @@
       const val = parseInt(intervalSlider.value, 10); // 150-1000
       userIntervalMs = val;
       intervalLabel.textContent = `${val}ms`;
+    };
+
+    // Word playback speed slider handler
+    wordSpeedSlider.oninput = () => {
+      const val = parseFloat(wordSpeedSlider.value); // 0.5-2.0
+      wordPlaybackSpeed = val;
+      wordSpeedLabel.textContent = `${val.toFixed(1)}x`;
     };
 
     // Realign smart scrub index when user seeks via the progress bar
