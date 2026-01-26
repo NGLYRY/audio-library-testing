@@ -26,8 +26,8 @@
   <input type="range" id="thresholdSlider" min="75" max="95" step="1" value="80">
   <span id="thresholdLabel">80th percentile</span><br><br>
   <label>Word Interval:</label>
-  <input type="range" id="intervalSlider" min="0" max="1000" step="50" value="500">
-  <span id="intervalLabel">500ms</span><br><br>
+  <input type="range" id="intervalSlider" min="0" max="1000" step="50" value="0">
+  <span id="intervalLabel">0ms</span><br><br>
   <label>Word Playback Speed:</label>
   <input type="range" id="wordSpeedSlider" min="0.5" max="2" step="0.1" value="1">
   <span id="wordSpeedLabel">1.0x</span><br><br>
@@ -69,6 +69,8 @@
     let audioContext = null;
     let gainNode = null;
     let mediaSource = null;
+    let wordPlayerGainNode = null;
+    let wordPlayerMediaSource = null;
     
     function initAudioGraph() {
       if (audioContext) return; // Only run once
@@ -80,6 +82,13 @@
       mediaSource.connect(gainNode);
       gainNode.connect(audioContext.destination);
       gainNode.gain.value = 1;
+      
+      // Set up word player with its own gain node for smooth fades
+      wordPlayerGainNode = audioContext.createGain();
+      wordPlayerMediaSource = audioContext.createMediaElementSource(wordPlayer);
+      wordPlayerMediaSource.connect(wordPlayerGainNode);
+      wordPlayerGainNode.connect(audioContext.destination);
+      wordPlayerGainNode.gain.value = 0; // Start silent
     }
     
     // Safari only allows AudioContext after user gesture
@@ -138,32 +147,76 @@
     }
 
     function playWordWithAudioElement(startSec, durationMs) {
+      // Ensure audio context is initialized
+      if (!audioContext || !wordPlayerGainNode) {
+        initAudioGraph();
+        if (audioContext.state === 'suspended') {
+          audioContext.resume();
+        }
+      }
+      
       // Stop any previous word playback
       if (wordPlayerTimeout) clearTimeout(wordPlayerTimeout);
-      wordPlayer.pause();
       
       try {
-        // Set playback speed and enable pitch preservation
+        const now = audioContext.currentTime;
+        // Scale fade times based on word playback speed
+        // At 1x: 200ms, at 2x: 100ms, at 0.5x: 400ms
+        const baseFadeMs = 200;
+        const fadeInMs = baseFadeMs / wordPlaybackSpeed;
+        const fadeOutMs = baseFadeMs / wordPlaybackSpeed;
+        const fadeIn = fadeInMs / 1000;
+        const fadeOut = fadeOutMs / 1000;
+        
+        // Fade out previous playback if still playing
+        wordPlayerGainNode.gain.cancelScheduledValues(now);
+        wordPlayerGainNode.gain.setValueAtTime(wordPlayerGainNode.gain.value, now);
+        wordPlayerGainNode.gain.linearRampToValueAtTime(0, now + Math.min(0.002, fadeIn));
+        
+        // Set playback speed immediately before pausing to ensure it takes effect
         wordPlayer.playbackRate = wordPlaybackSpeed;
         wordPlayer.preservesPitch = true;
         
-        // Seek to word start
-        wordPlayer.currentTime = startSec;
-        
-        // Calculate actual duration at the adjusted speed
-        const actualDurationMs = durationMs / wordPlaybackSpeed;
-        
-        // Play the word
-        const playPromise = wordPlayer.play();
-        if (playPromise !== undefined) {
-          playPromise.catch(e => console.error('Failed to play word:', e));
-        }
-        
-        // Stop after duration
-        wordPlayerTimeout = setTimeout(() => {
+        // Pause and seek after brief fade
+        setTimeout(() => {
           wordPlayer.pause();
-          wordPlayerTimeout = null;
-        }, actualDurationMs);
+          
+          // Reconfirm playback speed is set (in case it was reset)
+          wordPlayer.playbackRate = wordPlaybackSpeed;
+          
+          // Seek to word start
+          wordPlayer.currentTime = startSec;
+          
+          // Calculate actual duration at the adjusted speed
+          // Add fade times to ensure full word is heard
+          const actualDurationMs = durationMs / wordPlaybackSpeed;
+          const totalDurationMs = actualDurationMs + fadeInMs + fadeOutMs;
+          
+          // Play the word
+          const playPromise = wordPlayer.play();
+          if (playPromise !== undefined) {
+            playPromise.then(() => {
+              // Fade in after playback starts
+              const playNow = audioContext.currentTime;
+              wordPlayerGainNode.gain.cancelScheduledValues(playNow);
+              wordPlayerGainNode.gain.setValueAtTime(0, playNow);
+              wordPlayerGainNode.gain.linearRampToValueAtTime(1, playNow + fadeIn);
+              
+              // Schedule fade out at the end of the word (not before)
+              const fadeStartTime = playNow + (actualDurationMs / 1000);
+              wordPlayerGainNode.gain.setValueAtTime(1, fadeStartTime);
+              wordPlayerGainNode.gain.linearRampToValueAtTime(0, fadeStartTime + fadeOut);
+            }).catch(e => console.error('Failed to play word:', e));
+          }
+          
+          // Stop after full duration including fades
+          wordPlayerTimeout = setTimeout(() => {
+            wordPlayer.pause();
+            wordPlayerGainNode.gain.cancelScheduledValues(audioContext.currentTime);
+            wordPlayerGainNode.gain.setValueAtTime(0, audioContext.currentTime);
+            wordPlayerTimeout = null;
+          }, totalDurationMs);
+        }, 2);
         
         return true;
       } catch (e) {
@@ -185,11 +238,12 @@
     let isSmartScrubPaused = false;
     let manualThresholdPercentile = null; // User override for threshold
     let hasUserAdjustedThreshold = false; // Track if user manually set threshold
-    let userIntervalMs = 500; // User override for word interval
+    let userIntervalMs = 0; // User override for word interval
     let wordPlaybackSpeed = 1.0; // Speed for individual word playback
     let speedTimeout; // Debounce timeout for speed slider
     let internalSeekGuard = false; // Guard to ignore programmatic seeks
     let wordPlayerTimeout = null; // Track timeout for stopping word player
+    const WORD_OVERLAP_MS = 100; // Overlap between consecutive words for smooth transitions
     // Basic common words
     const commonWords = new Set(
       ["the","and","is","in","on","it","of","to","a","an","i","you","that","this",
@@ -418,7 +472,7 @@
       thresholdLabel.textContent = `${Math.round(dynamicP * 100)}th percentile`;
     }
 
-    // Speed slider with debouncing to prevent stuttering during adjustment
+    // Speed slider - input event just updates UI, doesn't recalc queue
     slider.addEventListener('input', () => {
       const sp = parseFloat(slider.value);
       
@@ -429,35 +483,14 @@
       // Update threshold slider to match speed
       updateThresholdUIFromSpeed();
       
-      // Clear previous timeout
-      clearTimeout(speedTimeout);
-      
-      // If already in smart scrub mode, just update parameters (don't restart)
+      // If in smart scrub mode, preserve current position but don't recalc yet
       if (timer !== null && sp > 2) {
-        // Smart scrub is active, parameters will be picked up by existing timer
-        // Only recalc words after user stops dragging
-        speedTimeout = setTimeout(() => {
-          recalcInformative(false); // Don't reset index during adjustment
-        }, 150);
-        return;
+        speedChangeTime = audio.currentTime;
       }
-      
-      // Set timeout for mode changes (entering/exiting smart scrub)
-      speedTimeout = setTimeout(() => {
-        if (sp > 2) {
-          recalcInformative(true);
-          if (!timer) startSmartScrub();
-        } else {
-          stopSmartScrub();
-          audio.playbackRate = sp;
-          audio.play().catch(() => {});
-        }
-      }, 100);
     });
     
     // Handle when user releases the slider for immediate response on mode changes
     slider.addEventListener('change', () => {
-      clearTimeout(speedTimeout);
       const sp = parseFloat(slider.value);
       
       fastSpeed = sp;
@@ -465,9 +498,20 @@
       updateThresholdUIFromSpeed();
       
       if (sp > 2) {
-        // If not in smart scrub, recalc and start; if already in, just recalc
-        recalcInformative(timer === null);
-        if (!timer) startSmartScrub();
+        // If not in smart scrub, recalc and start; if already in, recalc and realign
+        if (timer !== null) {
+          // Already in smart scrub, preserve position and realign queue
+          speedChangeTime = audio.currentTime;
+          recalcInformative(false);
+          // Realign to next word after the preserved position
+          nextIndex = 0;
+          while (nextIndex < informativeWords.length && informativeWords[nextIndex].start <= speedChangeTime) {
+            nextIndex++;
+          }
+        } else {
+          recalcInformative(true);
+          startSmartScrub();
+        }
       } else {
         stopSmartScrub();
         audio.playbackRate = sp;
@@ -486,7 +530,7 @@
 
     // Word interval slider handler
     intervalSlider.oninput = () => {
-      const val = parseInt(intervalSlider.value, 10); // 150-1000
+      const val = parseInt(intervalSlider.value, 10); // 0-1000ms
       userIntervalMs = val;
       intervalLabel.textContent = `${val}ms`;
     };
@@ -498,6 +542,9 @@
       wordSpeedLabel.textContent = `${val.toFixed(1)}x`;
     };
 
+    // Store the actual playback position when speed changes
+    let speedChangeTime = null;
+
     // Realign smart scrub index when user seeks via the progress bar
     audio.addEventListener('seeked', () => {
       // Ignore programmatic seeks from the scrubber itself
@@ -505,7 +552,14 @@
       // Only adjust when smart scrub is active
       if (timer !== null) {
         stopSmartSegment(8);
-        recalcInformative(true);
+        // Preserve the current position when speed changes
+        speedChangeTime = audio.currentTime;
+        recalcInformative(false);
+        // Realign to next word after the preserved position
+        nextIndex = 0;
+        while (nextIndex < informativeWords.length && informativeWords[nextIndex].start <= speedChangeTime) {
+          nextIndex++;
+        }
       }
     });
 
@@ -513,8 +567,9 @@
       // Smart-scrub mode: play words at fixed time intervals (faster speed = shorter intervals)
       audio.pause();
       audio.playbackRate = 1.0;
-      // Ensure audio context is running for buffer playback
-      if (audioContext.state === 'suspended') {
+      // Ensure audio context is initialized and running for buffer playback
+      if (!audioContext) initAudioGraph();
+      if (audioContext && audioContext.state === 'suspended') {
         audioContext.resume().catch(()=>{});
       }
       pauseBtn.style.display = 'inline-block';
@@ -526,7 +581,16 @@
       // Formula: 700ms / (speed - 1.5) gives ~700ms at 2.1x, ~467ms at 3x, ~280ms at 4x
       const getIntervalMs = () => {
         if (userIntervalMs !== null) return userIntervalMs;
-        return Math.max(150, 700 / Math.max(0.1, fastSpeed - 1.5));
+        return Math.max(0, 700 / Math.max(0.1, fastSpeed - 1.5));
+      };
+      
+      // Calculate overlap based on word interval
+      // At 0ms interval: full overlap (word starts before previous ends)
+      // At higher intervals: less overlap
+      const getOverlapMs = () => {
+        const intervalMs = getIntervalMs();
+        // Scale overlap from 100ms (at 0 interval) down to 0ms (at 500ms+ interval)
+        return Math.max(0, WORD_OVERLAP_MS * (1 - intervalMs / 500));
       };
       
       let lastPlayTime = Date.now();
@@ -538,7 +602,10 @@
         // Check if enough time has passed to play next word
         const now = Date.now();
         const gapMs = getIntervalMs(); // Gap between words (after word finishes)
-        if (now - lastPlayTime < gapMs) return;
+        const overlapMs = getOverlapMs(); // Overlap to smooth transitions
+        // Effective wait time = gap - overlap (overlap starts before previous word ends)
+        const effectiveWaitMs = Math.max(0, gapMs - overlapMs);
+        if (now - lastPlayTime < effectiveWaitMs) return;
 
         // Find next word
         if (nextIndex >= informativeWords.length) return stopSmartScrub();
@@ -576,9 +643,9 @@
         }
 
         // Advance to next word and update last play time
-        // lastPlayTime now includes word duration + gap for next cycle
+        // Account for overlap: next word starts before current word fully ends
         nextIndex++;
-        lastPlayTime = now + wordDurationMs; // Next word can play after: word duration + gap
+        lastPlayTime = now + wordDurationMs + gapMs - overlapMs;
         
       }, 50); // Check every 50ms
     }
@@ -587,7 +654,6 @@
       clearInterval(timer);
       timer = null;
       display.textContent = "";
-      pauseBtn.style.display = 'none';
       isSmartScrubPaused = false;
       // Stop any smart segment playback
       stopSmartSegment(8);
