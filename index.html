@@ -31,12 +31,16 @@
   <label>Word Playback Speed:</label>
   <input type="range" id="wordSpeedSlider" min="0.5" max="2" step="0.1" value="1">
   <span id="wordSpeedLabel">1.0x</span><br><br>
+  <label>Overlap Sources:</label>
+  <input type="range" id="overlapSourcesSlider" min="1" max="4" step="1" value="2">
+  <span id="overlapSourcesLabel">2</span><br><br>
   
   <button id="pauseBtn" style="display:none; padding:10px 20px; font-size:16px; cursor:pointer;">Pause Smart Scrub</button>
   <div id="keywordDisplay"></div>
 
   <div id="status"></div>
 
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/howler/2.2.4/howler.min.js"></script>
   <script>
     const API_KEY = "fae6aef01046408cb7e2c932adcf6e42"; 
     const uploadUrl = "https://api.assemblyai.com/v2/upload";
@@ -56,6 +60,8 @@
     const intervalLabel = document.getElementById('intervalLabel');
     const wordSpeedSlider = document.getElementById('wordSpeedSlider');
     const wordSpeedLabel = document.getElementById('wordSpeedLabel');
+    const overlapSourcesSlider = document.getElementById('overlapSourcesSlider');
+    const overlapSourcesLabel = document.getElementById('overlapSourcesLabel');
     const PRE_ROLL_SEC = 0.05; // Pre-roll before word for context
 
     // Web Audio API setup for smooth transitions
@@ -71,7 +77,63 @@
     let mediaSource = null;
     let wordPlayerGainNode = null;
     let wordPlayerMediaSource = null;
+    // Pool for overlapped, pitch-preserving HTMLAudio word playback (avoids single-element seek pops)
+    let wordPlayerPoolSize = 2;
+    const wordPlayers = [];
+    const wordPlayerGainNodes = [];
+    const wordPlayerMediaSources = [];
+    let wordPlayerPoolIndex = 0;
     
+    function ensureWordPlayerPoolInitialized() {
+      if (wordPlayers.length > 0) return;
+      wordPlayers.push(wordPlayer);
+    }
+
+    function resizeWordPlayerPool(newSize) {
+      const size = Math.max(1, Math.min(6, Math.floor(newSize || 1))); // clamp 1-6
+      ensureWordPlayerPoolInitialized();
+
+      // Add players if needed
+      while (wordPlayers.length < size) {
+        const i = wordPlayers.length;
+        const clone = wordPlayer.cloneNode();
+        clone.id = `wordPlayer_${i}`;
+        clone.style.display = 'none';
+        clone.preservesPitch = true;
+        clone.mozPreservesPitch = true;
+        clone.webkitPreservesPitch = true;
+        document.body.appendChild(clone);
+        wordPlayers.push(clone);
+      }
+
+      // Remove extra players (disconnect their nodes if exist)
+      while (wordPlayers.length > size) {
+        const removed = wordPlayers.pop();
+        const g = wordPlayerGainNodes.pop();
+        const m = wordPlayerMediaSources.pop();
+        try { if (m) m.disconnect(); } catch {}
+        try { if (g) g.disconnect(); } catch {}
+        try { removed.remove(); } catch {}
+      }
+
+      wordPlayerPoolSize = size;
+      wordPlayerPoolIndex = wordPlayerPoolIndex % wordPlayerPoolSize;
+
+      // Rewire gain/media sources for any newly added players
+      if (audioContext && wordPlayerGainNodes.length < wordPlayers.length) {
+        for (let idx = wordPlayerGainNodes.length; idx < wordPlayers.length; idx++) {
+          const p = wordPlayers[idx];
+          const g = audioContext.createGain();
+          const m = audioContext.createMediaElementSource(p);
+          m.connect(g);
+          g.connect(audioContext.destination);
+          g.gain.value = 0;
+          wordPlayerGainNodes[idx] = g;
+          wordPlayerMediaSources[idx] = m;
+        }
+      }
+    }
+
     function initAudioGraph() {
       if (audioContext) return; // Only run once
     
@@ -82,13 +144,9 @@
       mediaSource.connect(gainNode);
       gainNode.connect(audioContext.destination);
       gainNode.gain.value = 1;
-      
-      // Set up word player with its own gain node for smooth fades
-      wordPlayerGainNode = audioContext.createGain();
-      wordPlayerMediaSource = audioContext.createMediaElementSource(wordPlayer);
-      wordPlayerMediaSource.connect(wordPlayerGainNode);
-      wordPlayerGainNode.connect(audioContext.destination);
-      wordPlayerGainNode.gain.value = 0; // Start silent
+
+      ensureWordPlayerPoolInitialized();
+      resizeWordPlayerPool(wordPlayerPoolSize);
     }
     
     // Safari only allows AudioContext after user gesture
@@ -100,11 +158,19 @@
     // Set up hidden word player with full volume
     wordPlayer.volume = 1.0;
     wordPlayer.muted = false;
+    // Preserve pitch on pooled players
+    wordPlayer.preservesPitch = true;
+    wordPlayer.mozPreservesPitch = true;
+    wordPlayer.webkitPreservesPitch = true;
 
     // Smart-scrub playback via decoded buffer to avoid seek clicks
     let smartBuffer = null;                 // Decoded AudioBuffer of current track
     let smartSrc = null;                    // Current BufferSource for word playback
     let smartGain = null;                   // Gain node for word envelope
+    let wordHowl = null;                    // Howler instance for click-free word playback
+    let wordHowlUrl = null;                 // Object URL backing the Howler instance
+    const MAX_OVERLAP_SOURCES = 3;          // Cap simultaneous overlapping word plays
+    let activeWordHowlIds = [];             // Track active Howler play ids for overlap control
 
     async function decodeAudioFromBlob(blob) {
       try {
@@ -148,86 +214,127 @@
 
     function playWordWithAudioElement(startSec, durationMs) {
       // Ensure audio context is initialized
-      if (!audioContext || !wordPlayerGainNode) {
+      if (!audioContext || wordPlayerGainNodes.length === 0) {
         initAudioGraph();
         if (audioContext.state === 'suspended') {
           audioContext.resume();
         }
       }
       
-      // Stop any previous word playback
-      if (wordPlayerTimeout) clearTimeout(wordPlayerTimeout);
-      
       try {
-        const now = audioContext.currentTime;
-        // Scale fade times based on word playback speed
-        // At 1x: 200ms, at 2x: 100ms, at 0.5x: 400ms
-        const baseFadeMs = 200;
-        const fadeInMs = baseFadeMs / wordPlaybackSpeed;
-        const fadeOutMs = baseFadeMs / wordPlaybackSpeed;
+        const idx = wordPlayerPoolIndex % wordPlayers.length;
+        wordPlayerPoolIndex++;
+        const player = wordPlayers[idx];
+        const g = wordPlayerGainNodes[idx];
+
+        // Scale fade times; keep a small minimum to avoid edge clicks
+        const baseFadeMs = 240;
+        const minFadeMs = 12;
+        const fadeInMs = Math.max(minFadeMs, baseFadeMs / wordPlaybackSpeed);
+        const fadeOutMs = Math.max(minFadeMs, baseFadeMs / wordPlaybackSpeed);
         const fadeIn = fadeInMs / 1000;
         const fadeOut = fadeOutMs / 1000;
-        
-        // Fade out previous playback if still playing
-        wordPlayerGainNode.gain.cancelScheduledValues(now);
-        wordPlayerGainNode.gain.setValueAtTime(wordPlayerGainNode.gain.value, now);
-        wordPlayerGainNode.gain.linearRampToValueAtTime(0, now + Math.min(0.002, fadeIn));
-        
-        // Set playback speed immediately before pausing to ensure it takes effect
-        wordPlayer.playbackRate = wordPlaybackSpeed;
-        wordPlayer.preservesPitch = true;
-        
-        // Pause and seek after brief fade
-        setTimeout(() => {
-          wordPlayer.pause();
-          
-          // Reconfirm playback speed is set (in case it was reset)
-          wordPlayer.playbackRate = wordPlaybackSpeed;
-          
-          // Seek to word start
-          wordPlayer.currentTime = startSec;
-          
-          // Calculate actual duration at the adjusted speed
-          // Add fade times to ensure full word is heard
-          const actualDurationMs = durationMs / wordPlaybackSpeed;
-          const totalDurationMs = actualDurationMs + fadeInMs + fadeOutMs;
-          
-          // Play the word
-          const playPromise = wordPlayer.play();
-          if (playPromise !== undefined) {
-            playPromise.then(() => {
-              // Fade in after playback starts
-              const playNow = audioContext.currentTime;
-              wordPlayerGainNode.gain.cancelScheduledValues(playNow);
-              wordPlayerGainNode.gain.setValueAtTime(0, playNow);
-              wordPlayerGainNode.gain.linearRampToValueAtTime(1, playNow + fadeIn);
-              
-              // Schedule fade out at the end of the word (not before)
-              const fadeStartTime = playNow + (actualDurationMs / 1000);
-              wordPlayerGainNode.gain.setValueAtTime(1, fadeStartTime);
-              wordPlayerGainNode.gain.linearRampToValueAtTime(0, fadeStartTime + fadeOut);
-            }).catch(e => console.error('Failed to play word:', e));
-          }
-          
-          // Stop after full duration including fades
-          wordPlayerTimeout = setTimeout(() => {
-            wordPlayer.pause();
-            wordPlayerGainNode.gain.cancelScheduledValues(audioContext.currentTime);
-            wordPlayerGainNode.gain.setValueAtTime(0, audioContext.currentTime);
-            wordPlayerTimeout = null;
-          }, totalDurationMs);
-        }, 2);
+        const now = audioContext.currentTime;
+
+        // Reset and prep the chosen player
+        g.gain.cancelScheduledValues(now);
+        g.gain.setValueAtTime(0, now);
+        player.preservesPitch = true;
+        player.mozPreservesPitch = true;
+        player.webkitPreservesPitch = true;
+        player.playbackRate = wordPlaybackSpeed;
+
+        // Seek while muted
+        const seekTarget = Math.max(0, startSec); // no pre-roll to avoid mid-wave clicks
+        player.pause();
+        player.currentTime = seekTarget;
+
+        // Compute durations
+        const actualDurationMs = durationMs / wordPlaybackSpeed;
+        const totalDurationMs = actualDurationMs + fadeInMs + fadeOutMs;
+
+        // Play and envelope
+        const playPromise = player.play();
+        if (playPromise !== undefined) {
+          playPromise.then(() => {
+            const playNow = audioContext.currentTime;
+            g.gain.cancelScheduledValues(playNow);
+            g.gain.setValueAtTime(0, playNow);
+            g.gain.linearRampToValueAtTime(1, playNow + fadeIn);
+
+            const fadeStartTime = playNow + (actualDurationMs / 1000);
+            g.gain.setValueAtTime(1, fadeStartTime);
+            g.gain.linearRampToValueAtTime(0, fadeStartTime + fadeOut);
+          }).catch(e => console.error('Failed to play word:', e));
+        }
+
+        // Stop after full duration including fades for this player only
+        if (player._wordTimeout) clearTimeout(player._wordTimeout);
+        player._wordTimeout = setTimeout(() => {
+          try {
+            player.pause();
+            g.gain.cancelScheduledValues(audioContext.currentTime);
+            g.gain.setValueAtTime(0, audioContext.currentTime);
+          } catch {}
+          player._wordTimeout = null;
+        }, totalDurationMs + 10);
         
         return true;
       } catch (e) {
         console.error('Error playing word with audio element:', e);
         return false;
       }
-    }
+    } 
 
     function playSmartSegment(startSec, durationMs) {
-      // Use the hidden audio player with native pitch preservation
+      // Prefer Howler-based playback to avoid clicks on seek
+      if (playWordWithHowler(startSec, durationMs)) return true;
+      // Fallback to audio element if Howler is unavailable
       return playWordWithAudioElement(startSec, durationMs);
+    }
+
+    function playWordWithHowler(startSec, durationMs) {
+      if (!wordHowl || wordHowl.state() !== 'loaded') return false;
+
+      try {
+        const baseFadeMs = 180; // softer, short fades to minimize cuts
+        const fadeMs = baseFadeMs / wordPlaybackSpeed;
+        const actualDurationMs = durationMs / wordPlaybackSpeed;
+        const seekTarget = Math.max(0, startSec - PRE_ROLL_SEC);
+
+        const id = wordHowl.play();
+        activeWordHowlIds.push(id);
+
+        // Enforce overlap cap: if too many, fade+stop the oldest
+        if (activeWordHowlIds.length > MAX_OVERLAP_SOURCES) {
+          const oldestId = activeWordHowlIds.shift();
+          try {
+            wordHowl.fade(wordHowl.volume(oldestId), 0, fadeMs, oldestId);
+            setTimeout(() => { try { wordHowl.stop(oldestId); } catch {} }, fadeMs + 20);
+          } catch {}
+        }
+
+        wordHowl.rate(wordPlaybackSpeed, id);
+        wordHowl.volume(0, id);
+        wordHowl.seek(seekTarget, id);
+        wordHowl.fade(0, 1, fadeMs, id);
+
+        // Schedule fade out and stop, but allow overlap before fade starts
+        setTimeout(() => {
+          wordHowl.fade(1, 0, fadeMs, id);
+        }, actualDurationMs);
+
+        setTimeout(() => {
+          try { wordHowl.stop(id); } catch {}
+          activeWordHowlIds = activeWordHowlIds.filter(x => x !== id);
+        }, actualDurationMs + fadeMs + 30);
+
+        return true;
+      } catch (e) {
+        console.error('Howler playback error', e);
+        activeWordHowlIds = activeWordHowlIds.filter(x => x !== id);
+        return false;
+      }
     }
 
   let informativeWords = [];
@@ -281,6 +388,32 @@
       try {
         // Decode for smart-scrub playback
         smartBuffer = await decodeAudioFromBlob(blob);
+
+        // Rebuild Howler instance for click-free seeking playback
+        try {
+          if (wordHowl) {
+            wordHowl.unload();
+            wordHowl = null;
+          }
+          if (wordHowlUrl) {
+            URL.revokeObjectURL(wordHowlUrl);
+            wordHowlUrl = null;
+          }
+          wordHowlUrl = URL.createObjectURL(blob);
+          wordHowl = new Howl({
+            src: [wordHowlUrl],
+            html5: false, // use Web Audio for precise fades
+            preload: true,
+            onloaderror: (id, err) => console.error('Howler load error', err),
+            onplayerror: (id, err) => console.error('Howler play error', err)
+          });
+          // Sync pooled HTML players to the same object URL for no-seek option
+          ensureWordPlayerPoolInitialized();
+          resizeWordPlayerPool(wordPlayerPoolSize);
+          wordPlayers.forEach(p => { p.src = wordHowlUrl; });
+        } catch (e) {
+          console.error('Failed to init Howler for word playback', e);
+        }
         
         status.textContent = "Uploading audio...";
         const audioUrl = await uploadToAssembly(blob);
@@ -458,10 +591,14 @@
         hasUserAdjustedThreshold ? manualThresholdPercentile : null
       );
       if (resetIndexToCurrent) {
-        nextIndex = 0;
-        while (nextIndex < informativeWords.length && informativeWords[nextIndex].start <= audio.currentTime) {
-          nextIndex++;
-        }
+        realignNextIndexTo(audio.currentTime);
+      }
+    }
+
+    function realignNextIndexTo(timeSec) {
+      nextIndex = 0;
+      while (nextIndex < informativeWords.length && informativeWords[nextIndex].start <= timeSec) {
+        nextIndex++;
       }
     }
 
@@ -542,6 +679,18 @@
       wordSpeedLabel.textContent = `${val.toFixed(1)}x`;
     };
 
+    // Overlap sources slider handler
+    overlapSourcesSlider.oninput = () => {
+      const val = Math.round(parseInt(overlapSourcesSlider.value, 10) || 1);
+      overlapSourcesLabel.textContent = `${val}`;
+      wordPlayerPoolSize = val;
+      resizeWordPlayerPool(wordPlayerPoolSize);
+      // Ensure sources are in sync after resizing
+      if (wordHowlUrl) {
+        wordPlayers.forEach(p => { p.src = wordHowlUrl; });
+      }
+    };
+
     // Store the actual playback position when speed changes
     let speedChangeTime = null;
 
@@ -549,17 +698,23 @@
     audio.addEventListener('seeked', () => {
       // Ignore programmatic seeks from the scrubber itself
       if (internalSeekGuard) { internalSeekGuard = false; return; }
-      // Only adjust when smart scrub is active
+
+      const t = audio.currentTime;
+
+      // If smart scrub is active, realign queue
       if (timer !== null) {
         stopSmartSegment(8);
-        // Preserve the current position when speed changes
-        speedChangeTime = audio.currentTime;
+        speedChangeTime = t;
         recalcInformative(false);
-        // Realign to next word after the preserved position
-        nextIndex = 0;
-        while (nextIndex < informativeWords.length && informativeWords[nextIndex].start <= speedChangeTime) {
-          nextIndex++;
-        }
+        realignNextIndexTo(speedChangeTime);
+        return;
+      }
+
+      // If smart scrub is inactive but speed > 2, restart from the seeked position
+      if (fastSpeed > 2 && informativeWords.length > 0) {
+        recalcInformative(false);
+        realignNextIndexTo(t);
+        startSmartScrub();
       }
     });
 
