@@ -523,7 +523,7 @@
       console.groupEnd();
     }
 
-    // --- Length & Rarity-based word scoring ---
+    // --- Length & Rarity-based word scoring --- length driven, most rare words included (devesh)
     function selectInformativeWordsTFIDF(words, speed = 1, overridePercentile = null) {
       if (!Array.isArray(words) || words.length === 0) return [];
 
