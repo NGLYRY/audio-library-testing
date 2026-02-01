@@ -345,12 +345,13 @@
     const WORD_OVERLAP_MS = 100; // Overlap between consecutive words for smooth transitions
     // Basic common words
     const commonWords = new Set(
-      ["the","and","is","in","on","it","of","to","a","an","i","you","that","this",
-      "he","she","they","we","for","with","as","at","by","from","but","or","not", 
-      "be","was","were","are","have","has","had","do","does","did","so","if","no",
-      "yes","all","any","there","here","when","where","what","which","who","whom","why","how",
-      "my","your","his","her","its","our","their","me","him","them","us","one","about",
-      "like","just","more","some","out","up","down","now","then","also","than","too","very",
+      [
+      // "the","and","is","in","on","it","of","to","a","an","i","you","that","this",
+      // "he","she","they","we","for","with","as","at","by","from","but","or","not", 
+      // "be","was","were","are","have","has","had","do","does","did","so","if","no",
+      // "yes","all","any","there","here","when","where","what","which","who","whom","why","how",
+      // "my","your","his","her","its","our","their","me","him","them","us","one","about",
+      // "like","just","more","some","out","up","down","now","then","also","than","too","very",
       // "can","will","would","should","could","may","might","must", "go", "get", "got", "information"
       ]
     );
@@ -525,7 +526,23 @@
         text: (w.text || '').toLowerCase().replace(/[^a-z'\-]/gi, ''),
         start: w.start,
         end: w.end
-      })).filter(w => w.text && alpha.test(w.text) && !commonWords.has(w.text));
+      })).filter(w => {
+        if (!w.text || !alpha.test(w.text) || commonWords.has(w.text)) return false;
+        
+        // Filter out words with unrealistically short durations
+        // Minimum duration: 150ms base + 40ms per character
+        // Example: "public" (6 letters) should be at least 150 + 6*40 = 390ms
+        if (typeof w.end === 'number' && w.end > w.start) {
+          const durationMs = (w.end - w.start) * 1000;
+          const minDurationMs = 150 + (w.text.length * 20);
+          if (durationMs < minDurationMs) {
+            console.warn(`Filtering out "${w.text}" (${w.text.length} chars) with duration ${durationMs.toFixed(0)}ms (min: ${minDurationMs}ms)`);
+            return false;
+          }
+        }
+        
+        return true;
+      });
 
       if (tokens.length === 0) return [];
 
@@ -552,10 +569,10 @@
       scores.sort((a, b) => a - b);
       
       // Dynamic percentile based on playback speed (unless overridden)
-      // At 2.1x: 80th percentile (top 20% words - longer/rarer ones)
-      // At 3x: ~85th percentile (top 15% words)
-      // At 4x: ~92th percentile (top 8% words)
-      let p = Math.min(0.95, 0.80 + (speed - 2.1) * 0.08);
+      // At 2.0x: 50th percentile (top 50% words)
+      // At 3x: ~75th percentile (top 25% words)
+      // At 4x: ~87.5th percentile (top 12.5% words)
+      let p = Math.min(0.95, 0.50 + (speed - 2.0) * 0.125);
       if (overridePercentile !== null && overridePercentile >= 0.60 && overridePercentile <= 0.95) {
         p = overridePercentile; // Use user's manual override
       }
@@ -596,7 +613,7 @@
 
     // Update threshold slider UI based on speed (if user hasn't manually adjusted)
     function updateThresholdUIFromSpeed() {
-      const dynamicP = Math.min(0.95, 0.80 + (fastSpeed - 2.1) * 0.08);
+      const dynamicP = Math.min(0.95, 0.50 + (fastSpeed - 2.0) * 0.125);
       thresholdSlider.value = Math.round(dynamicP * 100);
       thresholdLabel.textContent = `${Math.round(dynamicP * 100)}th percentile`;
     }
