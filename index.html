@@ -279,10 +279,48 @@
     } 
 
     function playSmartSegment(startSec, durationMs) {
+      // Mute main audio during word playback to avoid clicks from overlapping audio
+      const now = audioContext.currentTime;
+      gainNode.gain.cancelScheduledValues(now);
+      gainNode.gain.setValueAtTime(gainNode.gain.value, now);
+      gainNode.gain.linearRampToValueAtTime(0, now + 0.01); // Quick mute
+      
       // Prefer Howler-based playback to avoid clicks on seek
-      if (playWordWithHowler(startSec, durationMs)) return true;
+      const played = playWordWithHowler(startSec, durationMs);
+      if (played) {
+        // Schedule unmute after word finishes
+        const fadeMs = (180 / wordPlaybackSpeed);
+        const actualDurationMs = durationMs / wordPlaybackSpeed;
+        setTimeout(() => {
+          const unmutNow = audioContext.currentTime;
+          gainNode.gain.cancelScheduledValues(unmutNow);
+          gainNode.gain.setValueAtTime(0, unmutNow);
+          gainNode.gain.linearRampToValueAtTime(1, unmutNow + 0.01); // Quick unmute
+        }, actualDurationMs + fadeMs + 50);
+        return true;
+      }
+      
       // Fallback to audio element if Howler is unavailable
-      return playWordWithAudioElement(startSec, durationMs);
+      const fallbackPlayed = playWordWithAudioElement(startSec, durationMs);
+      if (fallbackPlayed) {
+        // Schedule unmute after word finishes
+        const fadeMs = (240 / wordPlaybackSpeed);
+        const actualDurationMs = durationMs / wordPlaybackSpeed;
+        setTimeout(() => {
+          const unmutNow = audioContext.currentTime;
+          gainNode.gain.cancelScheduledValues(unmutNow);
+          gainNode.gain.setValueAtTime(0, unmutNow);
+          gainNode.gain.linearRampToValueAtTime(1, unmutNow + 0.01); // Quick unmute
+        }, actualDurationMs + fadeMs + 50);
+        return true;
+      }
+      
+      // If both failed, restore main audio immediately
+      const restoreNow = audioContext.currentTime;
+      gainNode.gain.cancelScheduledValues(restoreNow);
+      gainNode.gain.setValueAtTime(0, restoreNow);
+      gainNode.gain.linearRampToValueAtTime(1, restoreNow + 0.01);
+      return false;
     }
 
     function playWordWithHowler(startSec, durationMs) {
@@ -379,6 +417,9 @@
     // Shared function to load and process audio file
     async function loadAndProcessAudio(blob) {
       try {
+        // Ensure audio context is initialized before decoding
+        if (!audioContext) initAudioGraph();
+        
         // Decode for smart-scrub playback
         smartBuffer = await decodeAudioFromBlob(blob);
 
@@ -414,11 +455,22 @@
         status.textContent = "Processing transcription...";
         const words = await getTranscript(audioUrl);
         
-        // Display full transcript in console
-        displayTranscriptInConsole(words);
+        // Filter out words with unrealistically short durations (done once at load time)
+        const cleanedWords = words.filter(w => {
+          if (typeof w.end === 'number' && w.end > w.start) {
+            const durationMs = (w.end - w.start) * 1000;
+            const wordLength = (w.text || '').replace(/[^a-z'\-]/gi, '').length;
+            const minDurationMs = 150 + (wordLength * 15);
+            if (durationMs < minDurationMs) {
+              console.warn(`Filtering out "${w.text}" (${wordLength} chars) with duration ${durationMs.toFixed(0)}ms (min: ${minDurationMs}ms)`);
+              return false;
+            }
+          }
+          return true;
+        });
         
         // Cache full transcript for recalculating with different speeds
-        allTranscriptWords = words;
+        allTranscriptWords = cleanedWords;
         
         informativeWords = selectInformativeWordsTFIDF(words, fastSpeed);
         nextIndex = 0;
@@ -493,29 +545,6 @@
       return statusCheck.words.map(w => ({ text: w.text, start: w.start / 1000, end: w.end ? w.end / 1000 : undefined }));
     }
 
-    // Display transcript in browser console
-    function displayTranscriptInConsole(words) {
-      if (!words || words.length === 0) {
-        console.warn('No words in transcript');
-        return;
-      }
-      
-      words.forEach((word, index) => {
-        // word.start and word.end are already in seconds (converted in getTranscript)
-        const startTime = word.start.toFixed(2);
-        const endTime = word.end ? word.end.toFixed(2) : '?';
-        const confidence = word.confidence ? `${(word.confidence * 100).toFixed(0)}%` : 'N/A';
-        
-        console.log(`[${startTime}s - ${endTime}s] ${word.text} (${confidence})`);
-        
-        // Add spacing every 10 words
-        if ((index + 1) % 10 === 0) console.log('');
-      });
-      
-      console.log('%c━'.repeat(50), 'color: #ffd500');
-      console.groupEnd();
-    }
-
     // --- Length & Rarity-based word scoring --- length driven, most rare words included (devesh)
     function selectInformativeWordsTFIDF(words, speed = 1, overridePercentile = null) {
       if (!Array.isArray(words) || words.length === 0) return [];
@@ -528,19 +557,6 @@
         end: w.end
       })).filter(w => {
         if (!w.text || !alpha.test(w.text) || commonWords.has(w.text)) return false;
-        
-        // Filter out words with unrealistically short durations
-        // Minimum duration: 150ms base + 40ms per character
-        // Example: "public" (6 letters) should be at least 150 + 6*40 = 390ms
-        if (typeof w.end === 'number' && w.end > w.start) {
-          const durationMs = (w.end - w.start) * 1000;
-          const minDurationMs = 150 + (w.text.length * 20);
-          if (durationMs < minDurationMs) {
-            console.warn(`Filtering out "${w.text}" (${w.text.length} chars) with duration ${durationMs.toFixed(0)}ms (min: ${minDurationMs}ms)`);
-            return false;
-          }
-        }
-        
         return true;
       });
 
