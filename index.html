@@ -515,77 +515,64 @@
       console.groupEnd();
     }
 
-// --- Length & Rarity-based word scoring --- length driven, most rare words included (devesh)
-function selectInformativeWordsTFIDF(words, speed = 1, overridePercentile = null) {
-  if (!Array.isArray(words) || words.length === 0) return [];
+    // --- Length & Rarity-based word scoring --- length driven, most rare words included (devesh)
+    function selectInformativeWordsTFIDF(words, speed = 1, overridePercentile = null) {
+      if (!Array.isArray(words) || words.length === 0) return [];
 
-  const alpha = /[a-z]/i;
+      // Normalize tokens and filter basic noise
+      const alpha = /[a-z]/i;
+      const tokens = words.map(w => ({
+        text: (w.text || '').toLowerCase().replace(/[^a-z'\-]/gi, ''),
+        start: w.start,
+        end: w.end
+      })).filter(w => w.text && alpha.test(w.text) && !commonWords.has(w.text));
 
-  const tokens = words.map(w => ({
-    text: (w.text || '').toLowerCase().replace(/[^a-z'\-]/gi, ''),
-    start: w.start,
-    end: w.end
-  })).filter(w => w.text && alpha.test(w.text) && !commonWords.has(w.text));
+      if (tokens.length === 0) return [];
 
-  if (tokens.length === 0) return [];
+      // Count frequency of each word in transcript
+      const wordFreq = new Map();
+      for (const t of tokens) {
+        wordFreq.set(t.text, (wordFreq.get(t.text) || 0) + 1);
+      }
 
-  const freq = new Map();
-  for (const t of tokens) freq.set(t.text, (freq.get(t.text) || 0) + 1);
+      // Calculate score for each unique word based on length and rarity
+      // Score = word_length^2 / frequency
+      // Longer words get exponentially higher weight, rarer words get higher weight
+      const wordScores = new Map();
+      for (const [word, freq] of wordFreq.entries()) {
+        const length = word.length;
+        const rarity = 1 / freq; // Inverse frequency (rarer = higher)
+        const score = (length * length) * rarity; // Length squared times rarity factor
+        wordScores.set(word, score);
+      }
 
-  const median = (arr) => {
-    if (!arr.length) return 0;
-    const a = [...arr].sort((x, y) => x - y);
-    const mid = Math.floor(a.length / 2);
-    return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
-  };
+      // Build distribution of scores to set a dynamic threshold based on speed
+      const scores = Array.from(wordScores.values()).filter(v => isFinite(v) && v > 0);
+      if (scores.length === 0) return tokens; // fallback: return all tokens (already stopword-filtered)
+      scores.sort((a, b) => a - b);
+      
+      // Dynamic percentile based on playback speed (unless overridden)
+      // At 2.1x: 80th percentile (top 20% words - longer/rarer ones)
+      // At 3x: ~85th percentile (top 15% words)
+      // At 4x: ~92th percentile (top 8% words)
+      let p = Math.min(0.95, 0.80 + (speed - 2.1) * 0.08);
+      if (overridePercentile !== null && overridePercentile >= 0.60 && overridePercentile <= 0.95) {
+        p = overridePercentile; // Use user's manual override
+      }
+      const idx = Math.floor(p * (scores.length - 1));
+      const threshold = scores[idx];
 
-  const lengths = tokens.map(t => t.text.length);
-  const freqs = Array.from(freq.values());
+      // Attach per-token score based on its word score; filter by threshold
+      const informative = tokens
+        .map(t => ({ ...t, score: wordScores.get(t.text) || 0 }))
+        .filter(t => t.score >= threshold)
+        .sort((a, b) => a.start - b.start);
 
-  const medLen = Math.max(1, median(lengths));
-  const medFreq = Math.max(1, median(freqs));
+      // Map back to expected shape { text, start } for existing logic
+      return informative.map(({ text, start, end }) => ({ text, start, end }));
+    }
 
-  const lenWeight = 1.15;
-  const rarityWeight = 1.35;
-
-  const wordScores = new Map();
-  for (const [word, f] of freq.entries()) {
-    const len = word.length;
-    const lengthFactor = Math.pow(Math.max(0.6, len / medLen), lenWeight);
-    const rarityRatio = medFreq / Math.max(1, f);
-    const rarityFactor = Math.pow(Math.log1p(rarityRatio), rarityWeight);
-    const raw = lengthFactor * rarityFactor;
-    const score = Math.sqrt(raw);
-    wordScores.set(word, score);
-  }
-
-  const scores = Array.from(wordScores.values()).filter(v => isFinite(v) && v > 0);
-  if (scores.length === 0) {
-    return tokens.map(({ text, start, end }) => ({ text, start, end }));
-  }
-  scores.sort((a, b) => a - b);
-
-  let p;
-  if (overridePercentile !== null && overridePercentile >= 0.50 && overridePercentile <= 0.95) {
-    p = overridePercentile;
-  } else {
-    const s = Math.max(1, Math.min(6, speed));
-    p = 0.82 - 0.06 * (s - 2);
-    p = Math.max(0.60, Math.min(0.88, p));
-  }
-
-  const idx = Math.floor(p * (scores.length - 1));
-  const threshold = scores[idx];
-
-  const informative = tokens
-    .map(t => ({ ...t, score: wordScores.get(t.text) || 0 }))
-    .filter(t => t.score >= threshold)
-    .sort((a, b) => a.start - b.start);
-
-  return informative.map(({ text, start, end }) => ({ text, start, end }));
-}
-// Length & Rarity scoring --- END ---
-
+   // Length & Rarity scoring --- END ---
 
     // Helper to recalculate informative words with current settings
     function recalcInformative(resetIndexToCurrent = true) {
