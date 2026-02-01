@@ -23,8 +23,8 @@
   <input type="range" id="speed" min="0.5" max="4" step="0.1" value="1">
   <span id="label">1.0x</span><br><br>
   <label>Semantic Threshold:</label>
-  <input type="range" id="thresholdSlider" min="75" max="95" step="1" value="80">
-  <span id="thresholdLabel">80th percentile</span><br><br>
+  <input type="range" id="thresholdSlider" min="50" max="95" step="1" value="80">
+  <span id="thresholdLabel">50th percentile</span><br><br>
   <label>Word Interval:</label>
   <input type="range" id="intervalSlider" min="0" max="1000" step="50" value="0">
   <span id="intervalLabel">0ms</span><br><br>
@@ -32,8 +32,8 @@
   <input type="range" id="wordSpeedSlider" min="0.5" max="2" step="0.1" value="1">
   <span id="wordSpeedLabel">1.0x</span><br><br>
   <label>Overlap Sources:</label>
-  <input type="range" id="overlapSourcesSlider" min="1" max="4" step="1" value="2">
-  <span id="overlapSourcesLabel">2</span><br><br>
+  <input type="range" id="overlapSourcesSlider" min="1" max="4" step="1" value="3">
+  <span id="overlapSourcesLabel">3</span><br><br>
   
   <button id="pauseBtn" style="display:none; padding:10px 20px; font-size:16px; cursor:pointer;">Pause Smart Scrub</button>
   <div id="keywordDisplay"></div>
@@ -63,14 +63,6 @@
     const overlapSourcesSlider = document.getElementById('overlapSourcesSlider');
     const overlapSourcesLabel = document.getElementById('overlapSourcesLabel');
     const PRE_ROLL_SEC = 0.05; // Pre-roll before word for context
-
-    // Web Audio API setup for smooth transitions
-    /*const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    const gainNode = audioContext.createGain();
-    const source = audioContext.createMediaElementSource(audio);
-    source.connect(gainNode);
-    gainNode.connect(audioContext.destination);
-    gainNode.gain.value = 1;*/
 
     let audioContext = null;
     let gainNode = null;
@@ -354,12 +346,12 @@
     // Basic common words
     const commonWords = new Set(
       ["the","and","is","in","on","it","of","to","a","an","i","you","that","this",
-      "he","she","they","we","for","with","as","at","by","from","but","or","not",
+      "he","she","they","we","for","with","as","at","by","from","but","or","not", 
       "be","was","were","are","have","has","had","do","does","did","so","if","no",
       "yes","all","any","there","here","when","where","what","which","who","whom","why","how",
       "my","your","his","her","its","our","their","me","him","them","us","one","about",
       "like","just","more","some","out","up","down","now","then","also","than","too","very",
-      "can","will","would","should","could","may","might","must", "go", "get", "got", "information"
+      // "can","will","would","should","could","may","might","must", "go", "get", "got", "information"
       ]
     );
 
