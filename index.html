@@ -20,7 +20,7 @@
   <audio id="wordPlayer" style="display: none;" src="mp3s/manwhothinks.mp3"></audio><br>
 
   <label>Playback Speed:</label>
-  <input type="range" id="speed" min="0.5" max="4" step="0.1" value="1">
+  <input type="range" id="speed" min="0.5" max="6" step="0.1" value="1">
   <span id="label">1.0x</span><br><br>
   <label>Semantic Threshold:</label>
   <input type="range" id="thresholdSlider" min="50" max="95" step="1" value="80">
@@ -34,6 +34,9 @@
   <label>Overlap Sources:</label>
   <input type="range" id="overlapSourcesSlider" min="1" max="4" step="1" value="3">
   <span id="overlapSourcesLabel">3</span><br><br>
+  <label>Smart Scrub Start Speed:</label>
+  <input type="range" id="scrubStartSpeedSlider" min="1.5" max="6" step="0.1" value="2">
+  <span id="scrubStartSpeedLabel">2.0x</span><br><br>
   
   <button id="pauseBtn" style="display:none; padding:10px 20px; font-size:16px; cursor:pointer;">Pause Smart Scrub</button>
   <div id="keywordDisplay"></div>
@@ -62,6 +65,8 @@
     const wordSpeedLabel = document.getElementById('wordSpeedLabel');
     const overlapSourcesSlider = document.getElementById('overlapSourcesSlider');
     const overlapSourcesLabel = document.getElementById('overlapSourcesLabel');
+    const scrubStartSpeedSlider = document.getElementById('scrubStartSpeedSlider');
+    const scrubStartSpeedLabel = document.getElementById('scrubStartSpeedLabel');
     const PRE_ROLL_SEC = 0.05; // Pre-roll before word for context
 
     let audioContext = null;
@@ -377,6 +382,7 @@
     let hasUserAdjustedThreshold = false; // Track if user manually set threshold
     let userIntervalMs = 0; // User override for word interval
     let wordPlaybackSpeed = 1.0; // Speed for individual word playback
+    let scrubStartSpeed = 1.9; // Speed threshold at which smart scrubber starts (0.1 offset from displayed value)
     let speedTimeout; // Debounce timeout for speed slider
     let internalSeekGuard = false; // Guard to ignore programmatic seeks
     let wordPlayerTimeout = null; // Track timeout for stopping word player
@@ -585,10 +591,10 @@
       scores.sort((a, b) => a - b);
       
       // Dynamic percentile based on playback speed (unless overridden)
-      // At 2.0x: 50th percentile (top 50% words)
+      // At scrubStartSpeed: 50th percentile (top 50% words)
       // At 3x: ~75th percentile (top 25% words)
       // At 4x: ~87.5th percentile (top 12.5% words)
-      let p = Math.min(0.95, 0.50 + (speed - 2.0) * 0.125);
+      let p = Math.min(0.95, 0.50 + (speed - scrubStartSpeed) * 0.125);
       if (overridePercentile !== null && overridePercentile >= 0.60 && overridePercentile <= 0.95) {
         p = overridePercentile; // Use user's manual override
       }
@@ -629,7 +635,7 @@
 
     // Update threshold slider UI based on speed (if user hasn't manually adjusted)
     function updateThresholdUIFromSpeed() {
-      const dynamicP = Math.min(0.95, 0.50 + (fastSpeed - 2.0) * 0.125);
+      const dynamicP = Math.min(0.95, 0.50 + (fastSpeed - scrubStartSpeed) * 0.125);
       thresholdSlider.value = Math.round(dynamicP * 100);
       thresholdLabel.textContent = `${Math.round(dynamicP * 100)}th percentile`;
     }
@@ -646,7 +652,7 @@
       updateThresholdUIFromSpeed();
       
       // If in smart scrub mode, preserve current position but don't recalc yet
-      if (timer !== null && sp > 2) {
+      if (timer !== null && sp > scrubStartSpeed) {
         speedChangeTime = audio.currentTime;
       }
     });
@@ -659,7 +665,7 @@
       label.textContent = sp.toFixed(1) + "x";
       updateThresholdUIFromSpeed();
       
-      if (sp > 2) {
+      if (sp > scrubStartSpeed) {
         // If not in smart scrub, recalc and start; if already in, recalc and realign
         if (timer !== null) {
           // Already in smart scrub, preserve position and realign queue
@@ -716,6 +722,25 @@
       }
     };
 
+    // Smart scrub start speed slider handler
+    scrubStartSpeedSlider.oninput = () => {
+      const val = parseFloat(scrubStartSpeedSlider.value);
+      scrubStartSpeed = val - 0.1; // Subtract 0.1 from actual threshold for better matching
+      scrubStartSpeedLabel.textContent = `${val.toFixed(1)}x`; // Display slider value as-is
+      
+      // If currently playing, check if we need to switch modes
+      if (fastSpeed > scrubStartSpeed && timer === null) {
+        // Should be in smart scrub but isn't
+        recalcInformative(true);
+        startSmartScrub();
+      } else if (fastSpeed <= scrubStartSpeed && timer !== null) {
+        // Should not be in smart scrub but is
+        stopSmartScrub();
+        audio.playbackRate = fastSpeed;
+        audio.play().catch(() => {});
+      }
+    };
+
     // Store the actual playback position when speed changes
     let speedChangeTime = null;
 
@@ -735,8 +760,8 @@
         return;
       }
 
-      // If smart scrub is inactive but speed > 2, restart from the seeked position
-      if (fastSpeed > 2 && informativeWords.length > 0) {
+      // If smart scrub is inactive but speed > threshold, restart from the seeked position
+      if (fastSpeed > scrubStartSpeed && informativeWords.length > 0) {
         recalcInformative(false);
         realignNextIndexTo(t);
         startSmartScrub();
@@ -776,7 +801,7 @@
       let lastPlayTime = Date.now();
 
       timer = setInterval(() => {
-        if (fastSpeed <= 2) return stopSmartScrub();
+        if (fastSpeed <= scrubStartSpeed) return stopSmartScrub();
         if (isSmartScrubPaused) return;
 
         // Check if enough time has passed to play next word
